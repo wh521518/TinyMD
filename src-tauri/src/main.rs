@@ -8,8 +8,13 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicBool, Ordering},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State, WindowEvent,
+};
 
 const STATE_DIR_NAME: &str = "editor-state";
 const TEMP_DOCS_DIR_NAME: &str = "temp-docs";
@@ -17,6 +22,11 @@ const SESSION_FILE_NAME: &str = "session.json";
 const APP_NAME: &str = "TinyMD";
 const LEGACY_FALLBACK_APP_NAMES: &[&str] = &["TinyMd", "rust-milkdown"];
 const DEFAULT_IMAGE_DIR: &str = "assets";
+const TRAY_ID: &str = "main-tray";
+const TRAY_SHOW_ID: &str = "tray-show";
+const TRAY_QUIT_ID: &str = "tray-quit";
+const TRAY_REQUEST_EXIT_EVENT: &str = "tray-request-exit";
+const APP_CLOSE_INTENT_EVENT: &str = "app-close-intent";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +66,11 @@ struct LoadedEditorTabState {
     dirty: bool,
     temporary: bool,
     loaded: bool,
+}
+
+#[derive(Default)]
+struct AppLifecycleState {
+    allow_exit: AtomicBool,
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -1007,8 +1022,97 @@ fn save_image_asset(
     Ok(relative_path.to_string_lossy().replace('\\', "/"))
 }
 
+#[tauri::command]
+fn request_app_exit(app: AppHandle, lifecycle: State<AppLifecycleState>) -> Result<(), String> {
+    lifecycle.allow_exit.store(true, Ordering::SeqCst);
+
+    if let Some(window) = app.get_webview_window("main") {
+        window
+            .close()
+            .map_err(|err| format!("无法关闭应用窗口: {err}"))?;
+    } else {
+        app.exit(0);
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn move_main_window_to_tray(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "无法定位主窗口".to_string())?;
+
+    let _ = window.minimize();
+    window
+        .hide()
+        .map_err(|err| format!("无法隐藏主窗口: {err}"))?;
+
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
+        .manage(AppLifecycleState::default())
+        .setup(|app| {
+            let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示 TinyMD", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "退出 TinyMD", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let icon = app
+                .default_window_icon()
+                .cloned()
+                .ok_or("missing default window icon")?;
+
+            TrayIconBuilder::with_id(TRAY_ID)
+                .icon(icon)
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    TRAY_SHOW_ID => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    TRAY_QUIT_ID => {
+                        let _ = app.emit(TRAY_REQUEST_EXIT_EVENT, ());
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let lifecycle = window.state::<AppLifecycleState>();
+                if lifecycle.allow_exit.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                api.prevent_close();
+                let _ = window.emit(APP_CLOSE_INTENT_EVENT, ());
+            }
+        })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_launch_markdown_files,
@@ -1022,7 +1126,9 @@ fn main() {
             ensure_temporary_document_path,
             save_temporary_markdown_file,
             delete_temporary_document,
-            save_image_asset
+            save_image_asset,
+            request_app_exit,
+            move_main_window_to_tray
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

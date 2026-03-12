@@ -11,6 +11,7 @@ import {
   type DragEvent as ReactDragEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { message as showDialogMessage, open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TabsBar } from "./components/TabsBar";
@@ -105,6 +106,8 @@ const canUseLocalFilePath = (
 
 const TEMP_PREFIX = "temp:";
 const APP_NAME = "TinyMD";
+const APP_CLOSE_INTENT_EVENT = "app-close-intent";
+const TRAY_REQUEST_EXIT_EVENT = "tray-request-exit";
 const RECOVERED_PREFIX = "recovered:";
 const LANGUAGE_STORAGE_KEY = "tinymd.language";
 const IMAGE_FOLDER_STORAGE_KEY = "tinymd.imageFolder";
@@ -278,6 +281,11 @@ type UiText = {
   imageInserted: (name: string) => string;
   confirmCloseDirtyTab: (title: string) => string;
   confirmCloseDirtyWindow: (count: number) => string;
+  confirmCloseAction: string;
+  closeActionExit: string;
+  closeActionTray: string;
+  closeActionCancel: string;
+  minimizedToTray: string;
   unsavedSave: string;
   unsavedDiscard: string;
   unsavedCancel: string;
@@ -354,6 +362,11 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     confirmCloseDirtyTab: (title) => `“${title}”尚未保存。关闭前先保存吗？`,
     confirmCloseDirtyWindow: (count) =>
       `当前有 ${count} 个未保存文档。关闭应用前先保存吗？`,
+    confirmCloseAction: "关闭 TinyMD 时，是否退出应用，还是保存到托盘？",
+    closeActionExit: "退出",
+    closeActionTray: "保存到托盘",
+    closeActionCancel: "取消",
+    minimizedToTray: "应用已最小化到系统托盘。",
     unsavedSave: "保存",
     unsavedDiscard: "不保存",
     unsavedCancel: "取消",
@@ -428,6 +441,11 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     confirmCloseDirtyTab: (title) => `“${title}” has unsaved changes. Save before closing?`,
     confirmCloseDirtyWindow: (count) =>
       `${count} document(s) have unsaved changes. Save before closing the app?`,
+    confirmCloseAction: "When closing TinyMD, do you want to exit or keep it in the tray?",
+    closeActionExit: "Exit",
+    closeActionTray: "Keep in Tray",
+    closeActionCancel: "Cancel",
+    minimizedToTray: "TinyMD was minimized to the system tray.",
     unsavedSave: "Save",
     unsavedDiscard: "Don't Save",
     unsavedCancel: "Cancel",
@@ -698,6 +716,28 @@ export default function App() {
 
     if (result === t.unsavedDiscard) {
       return "discard";
+    }
+
+    return "cancel";
+  };
+
+  const promptCloseAction = async (): Promise<"exit" | "tray" | "cancel"> => {
+    const result = await showDialogMessage(t.confirmCloseAction, {
+      title: APP_NAME,
+      kind: "warning",
+      buttons: {
+        yes: t.closeActionExit,
+        no: t.closeActionTray,
+        cancel: t.closeActionCancel,
+      },
+    });
+
+    if (result === t.closeActionExit) {
+      return "exit";
+    }
+
+    if (result === t.closeActionTray) {
+      return "tray";
     }
 
     return "cancel";
@@ -1007,6 +1047,20 @@ export default function App() {
     return true;
   };
 
+  const exitApplication = async () => {
+    const canClose = await saveDirtyTabsBeforeWindowClose();
+    if (!canClose) {
+      return;
+    }
+
+    await invoke("request_app_exit");
+  };
+
+  const moveToTray = async () => {
+    await invoke("move_main_window_to_tray");
+    setMessage(t.minimizedToTray);
+  };
+
   const handleCreateDocument = () => {
     const index = tabs.filter((tab) => tab.temporary).length + 1;
     const title = `${t.untitledPrefix}${index}.md`;
@@ -1162,33 +1216,48 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
 
-    void getCurrentWindow()
-      .onCloseRequested(async (event) => {
-        if (allowWindowCloseRef.current) {
-          return;
-        }
-
-        event.preventDefault();
-        const canClose = await saveDirtyTabsBeforeWindowClose();
-        if (!canClose) {
-          return;
-        }
-
-        allowWindowCloseRef.current = true;
-        try {
-          await getCurrentWindow().close();
-        } finally {
-          allowWindowCloseRef.current = false;
-        }
-      })
-      .then((dispose) => {
-        unlisten = dispose;
-      });
+    void listen(TRAY_REQUEST_EXIT_EVENT, () => {
+      void exitApplication();
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
 
     return () => {
       unlisten?.();
     };
-  }, [saveDirtyTabsBeforeWindowClose]);
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let handlingClose = false;
+
+    void listen(APP_CLOSE_INTENT_EVENT, async () => {
+      if (handlingClose) {
+        return;
+      }
+
+      handlingClose = true;
+      try {
+        const action = await promptCloseAction();
+        if (action === "exit") {
+          await exitApplication();
+          return;
+        }
+
+        if (action === "tray") {
+          await moveToTray();
+        }
+      } finally {
+        handlingClose = false;
+      }
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [language, t]);
 
   useEffect(() => {
     if (!showOutline || editorMode !== "source") {
