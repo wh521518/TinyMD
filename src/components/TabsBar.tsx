@@ -6,6 +6,7 @@ type TabsBarProps = {
   activeTabId: string | null;
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
+  onContextMenu: (tab: EditorTab, position: { x: number; y: number }) => void;
 };
 
 export function TabsBar({
@@ -13,34 +14,46 @@ export function TabsBar({
   activeTabId,
   onActivate,
   onClose,
+  onContextMenu,
 }: TabsBarProps) {
+  if (tabs.length === 0) {
+    return <div className="tabs-bar is-empty" aria-hidden="true" />;
+  }
+
   return (
     <div className="tabs-bar">
-      {tabs.length === 0 ? (
-        <div className="tabs-empty">打开左侧 Markdown 文档开始编辑</div>
-      ) : (
-        tabs.map((tab) => (
-          <button
-            key={tab.id}
-            className={clsx("tab-chip", tab.id === activeTabId && "is-active")}
-            onClick={() => onActivate(tab.id)}
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          className={clsx("tab-chip", tab.id === activeTabId && "is-active")}
+          onClick={() => onActivate(tab.id)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            onContextMenu(tab, {
+              x: event.clientX,
+              y: event.clientY,
+            });
+          }}
+        >
+          <span className="tab-chip__title">
+            {tab.title}
+            {tab.dirty ? " *" : ""}
+          </span>
+          <span
+            className="tab-chip__close"
+            onClick={(event) => {
+              event.stopPropagation();
+              onClose(tab.id);
+            }}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
           >
-            <span className="tab-chip__title">
-              {tab.title}
-              {tab.dirty ? " *" : ""}
-            </span>
-            <span
-              className="tab-chip__close"
-              onClick={(event) => {
-                event.stopPropagation();
-                onClose(tab.id);
-              }}
-            >
-              ×
-            </span>
-          </button>
-        ))
-      )}
+            ×
+          </span>
+        </button>
+      ))}
     </div>
   );
 }

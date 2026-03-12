@@ -1,10 +1,3 @@
-export type TreeNode = {
-  name: string;
-  path: string;
-  kind: "file" | "folder";
-  children?: TreeNode[];
-};
-
 export type EditorTab = {
   id: string;
   path: string | null;
@@ -13,11 +6,5 @@ export type EditorTab = {
   savedContent: string;
   dirty: boolean;
   temporary: boolean;
-};
-
-export type TocItem = {
-  level: number;
-  text: string;
-  slug: string;
-  index: number;
+  loaded: boolean;
 };

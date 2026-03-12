@@ -38,18 +38,20 @@ const getHeadingLevel = (node: ProseNode | null) => {
   return level >= 1 && level <= 6 ? level : null;
 };
 
+const getFilterNodes = (ctx: Ctx) => {
+  try {
+    return ctx.get(blockConfig.key).filterNodes ?? DEFAULT_FILTER_NODES;
+  } catch {
+    return DEFAULT_FILTER_NODES;
+  }
+};
+
 const selectRootNodeByCoords = (
   ctx: Ctx,
   coords: { x: number; y: number },
 ): ActiveBlockNode | null => {
   const view = ctx.get(editorViewCtx);
-  const filterNodes = (() => {
-    try {
-      return ctx.get(blockConfig.key).filterNodes ?? DEFAULT_FILTER_NODES;
-    } catch {
-      return DEFAULT_FILTER_NODES;
-    }
-  })();
+  const filterNodes = getFilterNodes(ctx);
 
   try {
     const pos = view.posAtCoords({
@@ -143,9 +145,12 @@ export class CustomBlockHandle {
 
     document.addEventListener("pointerdown", this.#handleDocumentPointerDown, true);
     document.addEventListener("keydown", this.#handleDocumentKeyDown, true);
+    document.addEventListener("selectionchange", this.#handleSelectionChange);
     document.addEventListener("scroll", this.#handleDocumentScroll, true);
     window.addEventListener("resize", this.#handleWindowResize);
-    this.#view.dom.addEventListener("pointermove", this.#queueSyncFromEvent, true);
+    this.#view.dom.addEventListener("focus", this.#queueSyncFromEvent, true);
+    this.#view.dom.addEventListener("pointerup", this.#queueSyncFromEvent, true);
+    this.#view.dom.addEventListener("keyup", this.#queueSyncFromEvent, true);
 
     this.#rootObserver = new MutationObserver(() => {
       this.#bindHandle();
@@ -176,13 +181,16 @@ export class CustomBlockHandle {
       this.#syncFrame = null;
     }
 
-    this.#view.dom.removeEventListener("pointermove", this.#queueSyncFromEvent, true);
+    this.#view.dom.removeEventListener("focus", this.#queueSyncFromEvent, true);
+    this.#view.dom.removeEventListener("pointerup", this.#queueSyncFromEvent, true);
+    this.#view.dom.removeEventListener("keyup", this.#queueSyncFromEvent, true);
     document.removeEventListener(
       "pointerdown",
       this.#handleDocumentPointerDown,
       true,
     );
     document.removeEventListener("keydown", this.#handleDocumentKeyDown, true);
+    document.removeEventListener("selectionchange", this.#handleSelectionChange);
     document.removeEventListener("scroll", this.#handleDocumentScroll, true);
     window.removeEventListener("resize", this.#handleWindowResize);
 
@@ -263,6 +271,24 @@ export class CustomBlockHandle {
     if (event.key === "Escape") {
       this.#closeMenu();
     }
+  };
+
+  readonly #handleSelectionChange = () => {
+    const selection = document.getSelection();
+    if (!selection) {
+      return;
+    }
+
+    const anchorNode = selection.anchorNode;
+    if (
+      anchorNode instanceof Node &&
+      !this.#view.dom.contains(anchorNode) &&
+      !this.#root.contains(anchorNode)
+    ) {
+      return;
+    }
+
+    this.#queueSync();
   };
 
   readonly #handleDocumentScroll = () => {
@@ -375,20 +401,27 @@ export class CustomBlockHandle {
 
   #syncActive = () => {
     const handle = this.#handle;
-    if (!handle || handle.dataset.show !== "true") {
+    if (!handle || !this.#view.hasFocus()) {
       this.#active = null;
+      this.#setHandleVisible(false);
       this.#syncIndicator(null);
       this.#closeMenu();
       return;
     }
 
-    const handleRect = handle.getBoundingClientRect();
+    const selectionPos = this.#view.state.selection.$head.pos;
+    const caretRect = this.#view.coordsAtPos(selectionPos);
     const viewRect = this.#view.dom.getBoundingClientRect();
-    const x = Math.min(viewRect.left + 160, viewRect.right - 24);
-    const y = handleRect.top + handleRect.height / 2;
-    const nextActive = selectRootNodeByCoords(this.#ctx, { x, y });
+    const nextActive = selectRootNodeByCoords(this.#ctx, {
+      x: viewRect.left + viewRect.width / 2,
+      y: (caretRect.top + caretRect.bottom) / 2,
+    });
 
     if (!nextActive) {
+      this.#active = null;
+      this.#setHandleVisible(false);
+      this.#syncIndicator(null);
+      this.#closeMenu();
       return;
     }
 
@@ -397,7 +430,46 @@ export class CustomBlockHandle {
     }
 
     this.#active = nextActive;
+    this.#positionHandle(nextActive.el, caretRect);
+    this.#setHandleVisible(true);
     this.#syncIndicator(nextActive.node);
+  };
+
+  #positionHandle = (
+    activeElement: HTMLElement,
+    caretRect: { top: number; bottom: number },
+  ) => {
+    const handle = this.#handle;
+    if (!handle) {
+      return;
+    }
+
+    const activeRect = activeElement.getBoundingClientRect();
+    const handleRect = handle.getBoundingClientRect();
+    const rootRect = this.#root.getBoundingClientRect();
+    const left = `${Math.round(activeRect.left - rootRect.left - handleRect.width - 16)}px`;
+    const top = `${Math.round(
+      (caretRect.top + caretRect.bottom) / 2 - rootRect.top - handleRect.height / 2 - 2,
+    )}px`;
+
+    if (handle.style.left !== left) {
+      handle.style.left = left;
+    }
+
+    if (handle.style.top !== top) {
+      handle.style.top = top;
+    }
+  };
+
+  #setHandleVisible = (visible: boolean) => {
+    if (!this.#handle) {
+      return;
+    }
+
+    const nextValue = visible ? "true" : "false";
+    if (this.#handle.dataset.show !== nextValue) {
+      this.#handle.dataset.show = nextValue;
+    }
   };
 
   #openMenu = () => {
