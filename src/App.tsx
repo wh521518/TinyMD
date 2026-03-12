@@ -62,6 +62,8 @@ const getDroppedMarkdownPaths = (paths: string[]) =>
     ),
   );
 
+const isMarkdownFile = (file: File) => /\.(md|markdown)$/i.test(file.name);
+
 type DroppedFileWithPath = File & {
   path?: string;
 };
@@ -729,6 +731,66 @@ export default function App() {
     }
   };
 
+  const openDroppedMarkdownFiles = async (files: File[]) => {
+    const markdownFiles = files.filter(isMarkdownFile);
+    if (markdownFiles.length === 0) {
+      return;
+    }
+
+    const pathBackedFiles = markdownFiles
+      .map((file) => ({
+        file,
+        path: normalizeDroppedPath((file as DroppedFileWithPath).path ?? ""),
+      }))
+      .filter((entry): entry is { file: File; path: string } => Boolean(entry.path));
+
+    const pathBackedPaths = pathBackedFiles.map((entry) => entry.path);
+    const pathBackedNames = new Set(pathBackedFiles.map((entry) => entry.file.name));
+    const temporaryFiles = markdownFiles.filter((file) => !pathBackedNames.has(file.name));
+
+    if (pathBackedPaths.length > 0) {
+      await openPaths(pathBackedPaths);
+    }
+
+    if (temporaryFiles.length === 0) {
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const loadedTabs = await Promise.all(
+        temporaryFiles.map(async (file, index) => {
+          const content = await file.text();
+          const title = file.name;
+          const id = `${TEMP_PREFIX}drop:${Date.now()}:${index}:${title}`;
+          const nextTab: EditorTab = {
+            id,
+            path: null,
+            title,
+            content,
+            savedContent: content,
+            dirty: false,
+            temporary: true,
+            loaded: true,
+          };
+          return nextTab;
+        }),
+      );
+
+      setTabs((current) => [...current, ...loadedTabs]);
+      setActiveTabId(loadedTabs[loadedTabs.length - 1]?.id ?? activeTabIdRef.current);
+      setMessage(
+        loadedTabs.length === 1
+          ? t.openedFile(loadedTabs[0].title)
+          : t.openedFiles(loadedTabs.length),
+      );
+    } catch (error) {
+      setMessage(t.openFailed(String(error)));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleOpenFiles = async () => {
     const result = await open({
       directory: false,
@@ -1334,6 +1396,15 @@ export default function App() {
     void openPaths(markdownPaths);
   });
 
+  const handleDroppedFiles = useEffectEvent((files: File[]) => {
+    const markdownFiles = files.filter(isMarkdownFile);
+    if (markdownFiles.length === 0) {
+      return;
+    }
+
+    void openDroppedMarkdownFiles(markdownFiles);
+  });
+
   const saveImageAssetFromFile = async (file: File) => {
     if (!activeTab || !activeTab.loaded) {
       setMessage(t.loading);
@@ -1648,10 +1719,11 @@ export default function App() {
         return;
       }
 
+      const files = Array.from(event.dataTransfer?.files ?? []);
       const paths = getDroppedPathsFromDataTransfer(event.dataTransfer);
       logAppDrag("document-file-drop", {
         target: describeDragTarget(event.target),
-        files: Array.from(event.dataTransfer?.files ?? []).map((file) => ({
+        files: files.map((file) => ({
           name: file.name,
           path: (file as DroppedFileWithPath).path ?? null,
         })),
@@ -1660,7 +1732,12 @@ export default function App() {
 
       clearExternalDragState();
       event.preventDefault();
-      void handleDroppedPaths(paths);
+      if (paths.length > 0) {
+        void handleDroppedPaths(paths);
+        return;
+      }
+
+      void handleDroppedFiles(files);
     };
 
     document.addEventListener("dragenter", handleDocumentDragEnter, true);
@@ -1674,7 +1751,7 @@ export default function App() {
       document.removeEventListener("dragleave", handleDocumentDragLeave, true);
       document.removeEventListener("drop", handleDocumentDrop, true);
     };
-  }, [handleDroppedPaths]);
+  }, [handleDroppedFiles, handleDroppedPaths]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
