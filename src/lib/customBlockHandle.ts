@@ -3,7 +3,7 @@ import { editorViewCtx } from "@milkdown/kit/core";
 import { blockConfig } from "@milkdown/kit/plugin/block";
 import { paragraphSchema } from "@milkdown/kit/preset/commonmark";
 import type { Node as ProseNode, ResolvedPos } from "@milkdown/prose/model";
-import { TextSelection } from "@milkdown/prose/state";
+import { NodeSelection, TextSelection } from "@milkdown/prose/state";
 import type { EditorView } from "@milkdown/prose/view";
 
 type ActiveBlockNode = Readonly<{
@@ -114,7 +114,6 @@ export class CustomBlockHandle {
   #observer: MutationObserver | null = null;
   #rootObserver: MutationObserver | null = null;
   #menuOpen = false;
-  #dragJustEnded = false;
   #destroyed = false;
   #syncFrame: number | null = null;
 
@@ -215,13 +214,9 @@ export class CustomBlockHandle {
     this.#deleteActiveBlock();
   };
 
-  readonly #handleTriggerClick = (event: MouseEvent) => {
+  readonly #handleTriggerContextMenu = (event: MouseEvent) => {
+    event.preventDefault();
     event.stopPropagation();
-
-    if (this.#dragJustEnded) {
-      this.#dragJustEnded = false;
-      return;
-    }
 
     if (!this.#active) {
       this.#syncActive();
@@ -243,16 +238,36 @@ export class CustomBlockHandle {
     this.#openMenu();
   };
 
-  readonly #handleDragStart = () => {
-    this.#dragJustEnded = false;
+  readonly #handleDragStart = (event: DragEvent) => {
     this.#closeMenu();
-  };
 
-  readonly #handleDragEnd = () => {
-    this.#dragJustEnded = true;
-    window.setTimeout(() => {
-      this.#dragJustEnded = false;
-    }, 0);
+    if (!this.#active) {
+      this.#syncActive();
+    }
+
+    const active = this.#active;
+    if (!active || !event.dataTransfer) {
+      return;
+    }
+
+    try {
+      const selection = NodeSelection.create(this.#view.state.doc, active.$pos.pos);
+      this.#view.dispatch(this.#view.state.tr.setSelection(selection));
+
+      const slice = selection.content();
+      const { dom, text } = this.#view.serializeForClipboard(slice);
+      event.dataTransfer.effectAllowed = "copyMove";
+      event.dataTransfer.clearData();
+      event.dataTransfer.setData("text/html", dom.innerHTML);
+      event.dataTransfer.setData("text/plain", text);
+      event.dataTransfer.setDragImage(active.el, 0, 0);
+      this.#view.dragging = {
+        slice,
+        move: true,
+      };
+    } catch {
+      // Let Milkdown's own drag handler continue if node selection cannot be created.
+    }
   };
 
   readonly #handleDocumentPointerDown = (event: PointerEvent) => {
@@ -346,8 +361,7 @@ export class CustomBlockHandle {
     }
 
     this.#handle.addEventListener("dragstart", this.#handleDragStart);
-    this.#handle.addEventListener("dragend", this.#handleDragEnd);
-    this.#trigger.addEventListener("click", this.#handleTriggerClick);
+    this.#trigger.addEventListener("contextmenu", this.#handleTriggerContextMenu);
 
     this.#observer = new MutationObserver(() => {
       this.#queueSync();
@@ -365,13 +379,15 @@ export class CustomBlockHandle {
     this.#observer = null;
 
     if (this.#trigger) {
-      this.#trigger.removeEventListener("click", this.#handleTriggerClick);
+      this.#trigger.removeEventListener(
+        "contextmenu",
+        this.#handleTriggerContextMenu,
+      );
       this.#trigger.classList.remove("custom-block-handle__trigger");
     }
 
     if (this.#handle) {
       this.#handle.removeEventListener("dragstart", this.#handleDragStart);
-      this.#handle.removeEventListener("dragend", this.#handleDragEnd);
       this.#handle.classList.remove("custom-block-handle");
       this.#handle.dataset.menuOpen = "false";
     }
@@ -401,25 +417,22 @@ export class CustomBlockHandle {
 
   #syncActive = () => {
     const handle = this.#handle;
-    if (!handle || !this.#view.hasFocus()) {
+    if (!handle || handle.dataset.show !== "true") {
       this.#active = null;
-      this.#setHandleVisible(false);
       this.#syncIndicator(null);
       this.#closeMenu();
       return;
     }
 
-    const selectionPos = this.#view.state.selection.$head.pos;
-    const caretRect = this.#view.coordsAtPos(selectionPos);
-    const viewRect = this.#view.dom.getBoundingClientRect();
     const nextActive = selectRootNodeByCoords(this.#ctx, {
-      x: viewRect.left + viewRect.width / 2,
-      y: (caretRect.top + caretRect.bottom) / 2,
+      x: handle.getBoundingClientRect().right + 32,
+      y:
+        handle.getBoundingClientRect().top +
+        handle.getBoundingClientRect().height / 2,
     });
 
     if (!nextActive) {
       this.#active = null;
-      this.#setHandleVisible(false);
       this.#syncIndicator(null);
       this.#closeMenu();
       return;
@@ -430,46 +443,7 @@ export class CustomBlockHandle {
     }
 
     this.#active = nextActive;
-    this.#positionHandle(nextActive.el, caretRect);
-    this.#setHandleVisible(true);
     this.#syncIndicator(nextActive.node);
-  };
-
-  #positionHandle = (
-    activeElement: HTMLElement,
-    caretRect: { top: number; bottom: number },
-  ) => {
-    const handle = this.#handle;
-    if (!handle) {
-      return;
-    }
-
-    const activeRect = activeElement.getBoundingClientRect();
-    const handleRect = handle.getBoundingClientRect();
-    const rootRect = this.#root.getBoundingClientRect();
-    const left = `${Math.round(activeRect.left - rootRect.left - handleRect.width - 16)}px`;
-    const top = `${Math.round(
-      (caretRect.top + caretRect.bottom) / 2 - rootRect.top - handleRect.height / 2 - 2,
-    )}px`;
-
-    if (handle.style.left !== left) {
-      handle.style.left = left;
-    }
-
-    if (handle.style.top !== top) {
-      handle.style.top = top;
-    }
-  };
-
-  #setHandleVisible = (visible: boolean) => {
-    if (!this.#handle) {
-      return;
-    }
-
-    const nextValue = visible ? "true" : "false";
-    if (this.#handle.dataset.show !== nextValue) {
-      this.#handle.dataset.show = nextValue;
-    }
   };
 
   #openMenu = () => {

@@ -1,5 +1,6 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -15,6 +16,7 @@ const TEMP_DOCS_DIR_NAME: &str = "temp-docs";
 const SESSION_FILE_NAME: &str = "session.json";
 const APP_NAME: &str = "TinyMD";
 const LEGACY_FALLBACK_APP_NAMES: &[&str] = &["TinyMd", "rust-milkdown"];
+const DEFAULT_IMAGE_DIR: &str = "assets";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +75,105 @@ fn read_file(path: &str) -> Result<String, String> {
 
 fn write_file(path: &str, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|err| format!("无法保存文件 {path}: {err}"))
+}
+
+fn is_supported_image_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif"
+    )
+}
+
+fn image_mime_type(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
+}
+
+fn sanitize_image_dir(value: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim().replace('\\', "/");
+    let candidate = if trimmed.is_empty() {
+        DEFAULT_IMAGE_DIR
+    } else {
+        trimmed.as_str()
+    };
+
+    let mut sanitized = PathBuf::new();
+    for component in Path::new(candidate).components() {
+        match component {
+            std::path::Component::Normal(value) => sanitized.push(value),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err("图片目录必须是相对路径，且不能包含 ..".to_string());
+            }
+        }
+    }
+
+    if sanitized.as_os_str().is_empty() {
+        sanitized.push(DEFAULT_IMAGE_DIR);
+    }
+
+    Ok(sanitized)
+}
+
+fn sanitize_image_stem(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    for ch in value.trim().chars() {
+        if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            || ch.is_control()
+        {
+            sanitized.push('-');
+        } else {
+            sanitized.push(ch);
+        }
+    }
+
+    let trimmed = sanitized.trim_matches(|ch: char| ch.is_whitespace() || ch == '.');
+    if trimmed.is_empty() {
+        "image".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_unique_image_path(target_dir: &Path, file_name: Option<&str>) -> PathBuf {
+    let preferred_name = file_name.unwrap_or("image.png");
+    let preferred_path = Path::new(preferred_name);
+    let stem = preferred_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_image_stem)
+        .unwrap_or_else(|| "image".to_string());
+    let extension = preferred_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| is_supported_image_extension(value))
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "png".to_string());
+
+    let mut index = 0usize;
+    loop {
+        let file_name = if index == 0 {
+            format!("{stem}.{extension}")
+        } else {
+            format!("{stem}-{index}.{extension}")
+        };
+        let candidate = target_dir.join(file_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        index += 1;
+    }
 }
 
 fn legacy_state_dir() -> Result<PathBuf, String> {
@@ -241,6 +342,25 @@ fn temp_file_name(tab_id: &str) -> String {
     format!("{sanitized}.md")
 }
 
+fn temp_doc_slug(tab_id: &str) -> String {
+    temp_file_name(tab_id)
+        .strip_suffix(".md")
+        .unwrap_or("untitled")
+        .to_string()
+}
+
+fn legacy_temp_doc_path(app: &AppHandle, tab_id: &str) -> Result<PathBuf, String> {
+    Ok(temp_docs_dir(app)?.join(temp_file_name(tab_id)))
+}
+
+fn temp_doc_dir_path(app: &AppHandle, tab_id: &str) -> Result<PathBuf, String> {
+    Ok(temp_docs_dir(app)?.join(temp_doc_slug(tab_id)))
+}
+
+fn temp_doc_path(app: &AppHandle, tab_id: &str) -> Result<PathBuf, String> {
+    Ok(temp_doc_dir_path(app, tab_id)?.join("document.md"))
+}
+
 fn recovered_tab_id(original_id: &str) -> String {
     format!("recovered:{original_id}")
 }
@@ -278,16 +398,137 @@ fn into_loaded_tab(tab: EditorTabState, loaded: bool) -> LoadedEditorTabState {
     }
 }
 
+fn assign_temp_doc_path(app: &AppHandle, tab: &mut EditorTabState) -> Result<(), String> {
+    tab.path = Some(normalize(temp_doc_path(app, &tab.id)?));
+    Ok(())
+}
+
+fn replace_asset_reference(content: String, old_path: &str, new_path: &str) -> String {
+    content
+        .replace(&format!("({old_path})"), &format!("({new_path})"))
+        .replace(&format!("\"{old_path}\""), &format!("\"{new_path}\""))
+        .replace(&format!("'{old_path}'"), &format!("'{new_path}'"))
+}
+
+fn copy_temp_assets_and_rewrite(
+    temp_doc_dir: &Path,
+    temp_doc_path: &Path,
+    target_doc_path: &Path,
+    content: &str,
+) -> Result<String, String> {
+    if !temp_doc_dir.exists() {
+        return Ok(content.to_string());
+    }
+
+    let target_doc_dir = target_doc_path
+        .parent()
+        .ok_or_else(|| format!("无法定位文档目录: {}", target_doc_path.display()))?;
+    fs::create_dir_all(target_doc_dir).map_err(|err| {
+        format!(
+            "无法创建文档目录 {}: {err}",
+            target_doc_dir.display()
+        )
+    })?;
+
+    let mut rewritten = content.to_string();
+    let mut pending = vec![temp_doc_dir.to_path_buf()];
+
+    while let Some(current_dir) = pending.pop() {
+        let entries = fs::read_dir(&current_dir)
+            .map_err(|err| format!("无法遍历临时资源目录 {}: {err}", current_dir.display()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("无法读取临时资源目录项: {err}"))?;
+            let source_path = entry.path();
+
+            if source_path == temp_doc_path {
+                continue;
+            }
+
+            if source_path.is_dir() {
+                pending.push(source_path);
+                continue;
+            }
+
+            if !source_path.is_file() {
+                continue;
+            }
+
+            let relative_source = source_path
+                .strip_prefix(temp_doc_dir)
+                .map_err(|err| {
+                    format!(
+                        "无法计算临时资源相对路径 {}: {err}",
+                        source_path.display()
+                    )
+                })?;
+            let destination_path = target_doc_dir.join(relative_source);
+            let destination_dir = destination_path
+                .parent()
+                .ok_or_else(|| format!("无法定位目标资源目录: {}", destination_path.display()))?;
+            fs::create_dir_all(destination_dir).map_err(|err| {
+                format!(
+                    "无法创建目标资源目录 {}: {err}",
+                    destination_dir.display()
+                )
+            })?;
+
+            let final_destination = if destination_path.exists() {
+                build_unique_image_path(
+                    destination_dir,
+                    destination_path.file_name().and_then(|value| value.to_str()),
+                )
+            } else {
+                destination_path
+            };
+
+            fs::copy(&source_path, &final_destination).map_err(|err| {
+                format!(
+                    "无法迁移临时资源 {} -> {}: {err}",
+                    source_path.display(),
+                    final_destination.display()
+                )
+            })?;
+
+            let old_relative = relative_source.to_string_lossy().replace('\\', "/");
+            let new_relative = final_destination
+                .strip_prefix(target_doc_dir)
+                .map_err(|err| {
+                    format!(
+                        "无法计算目标资源相对路径 {}: {err}",
+                        final_destination.display()
+                    )
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            if old_relative != new_relative {
+                rewritten = replace_asset_reference(rewritten, &old_relative, &new_relative);
+            }
+        }
+    }
+
+    Ok(rewritten)
+}
+
 fn sync_temp_docs(app: &AppHandle, session: &EditorSessionState) -> Result<(), String> {
     let temp_dir = temp_docs_dir(app)?;
-    let mut active_files = HashSet::new();
+    let mut active_dirs = HashSet::new();
 
     for tab in session.tabs.iter().filter(|tab| tab.temporary) {
-        let file_name = temp_file_name(&tab.id);
-        let file_path = temp_dir.join(&file_name);
+        let tab_dir = temp_doc_dir_path(app, &tab.id)?;
+        let file_path = tab_dir.join("document.md");
+        fs::create_dir_all(&tab_dir)
+            .map_err(|err| format!("无法创建临时文档目录 {}: {err}", tab_dir.display()))?;
         fs::write(&file_path, &tab.content)
             .map_err(|err| format!("无法保存临时文档 {}: {err}", file_path.display()))?;
-        active_files.insert(file_name);
+        active_dirs.insert(
+            tab_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        );
     }
 
     let entries = fs::read_dir(&temp_dir)
@@ -295,13 +536,20 @@ fn sync_temp_docs(app: &AppHandle, session: &EditorSessionState) -> Result<(), S
 
     for entry in entries {
         let entry = entry.map_err(|err| format!("无法读取临时文档目录项: {err}"))?;
+        let path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
-        if !active_files.contains(&file_name) {
-            let path = entry.path();
-            if path.is_file() {
-                fs::remove_file(&path)
-                    .map_err(|err| format!("无法删除旧临时文档 {}: {err}", path.display()))?;
+        if path.is_dir() {
+            if !active_dirs.contains(&file_name) {
+                fs::remove_dir_all(&path).map_err(|err| {
+                    format!("无法删除旧临时文档目录 {}: {err}", path.display())
+                })?;
             }
+            continue;
+        }
+
+        if path.is_file() {
+            fs::remove_file(&path)
+                .map_err(|err| format!("无法删除旧临时文档 {}: {err}", path.display()))?;
         }
     }
 
@@ -309,14 +557,21 @@ fn sync_temp_docs(app: &AppHandle, session: &EditorSessionState) -> Result<(), S
 }
 
 fn read_temp_doc_content(app: &AppHandle, tab_id: &str) -> Result<Option<String>, String> {
-    let path = temp_docs_dir(app)?.join(temp_file_name(tab_id));
-    if !path.exists() {
+    let path = temp_doc_path(app, tab_id)?;
+    if path.exists() {
+        return fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|err| format!("无法读取临时文档 {}: {err}", path.display()));
+    }
+
+    let legacy_path = legacy_temp_doc_path(app, tab_id)?;
+    if !legacy_path.exists() {
         return Ok(None);
     }
 
-    fs::read_to_string(&path)
+    fs::read_to_string(&legacy_path)
         .map(Some)
-        .map_err(|err| format!("无法读取临时文档 {}: {err}", path.display()))
+        .map_err(|err| format!("无法读取临时文档 {}: {err}", legacy_path.display()))
 }
 
 fn validate_external_url(url: &str) -> Result<&str, String> {
@@ -417,6 +672,7 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
             if let Some(content) = read_temp_doc_content(&app, &tab.id)? {
                 tab.content = content;
             }
+            assign_temp_doc_path(&app, &mut tab)?;
 
             if is_requested_active {
                 restored_active_id = Some(tab.id.clone());
@@ -427,7 +683,8 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
         }
 
         let Some(path) = tab.path.clone() else {
-            let recovered = recover_file_tab(&tab);
+            let mut recovered = recover_file_tab(&tab);
+            assign_temp_doc_path(&app, &mut recovered)?;
             warnings.push(format!(
                 "已恢复 {}，原文件路径缺失，请重新保存。",
                 recovered.title
@@ -455,6 +712,7 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
         if !path_ref.exists() {
             let mut recovered = recover_file_tab(&tab);
             recovered.title = recovered_tab_title(Some(&normalized_path), &tab.title);
+            assign_temp_doc_path(&app, &mut recovered)?;
             warnings.push(format!(
                 "文件不存在，已将 {} 恢复为临时文档。",
                 recovered.title
@@ -469,6 +727,7 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
         if !path_ref.is_file() || !is_markdown(path_ref) {
             let mut recovered = recover_file_tab(&tab);
             recovered.title = recovered_tab_title(Some(&normalized_path), &tab.title);
+            assign_temp_doc_path(&app, &mut recovered)?;
             warnings.push(format!(
                 "文件不可用，已将 {} 恢复为临时文档。",
                 recovered.title
@@ -500,6 +759,7 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
                     Err(_) => {
                         let mut recovered = recover_file_tab(&tab);
                         recovered.title = recovered_tab_title(Some(&normalized_path), &tab.title);
+                        assign_temp_doc_path(&app, &mut recovered)?;
                         warnings.push(format!(
                             "无法读取文件，已将 {} 恢复为临时文档。",
                             recovered.title
@@ -536,6 +796,7 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
             Err(_) => {
                 let mut recovered = recover_file_tab(&tab);
                 recovered.title = recovered_tab_title(Some(&normalized_path), &tab.title);
+                assign_temp_doc_path(&app, &mut recovered)?;
                 warnings.push(format!(
                     "无法读取文件，已将 {} 恢复为临时文档。",
                     recovered.title
@@ -635,6 +896,96 @@ fn open_file_location(path: String) -> Result<(), String> {
     reveal_path(&target)
 }
 
+#[tauri::command]
+fn read_image_data_url(path: String) -> Result<String, String> {
+    let target = PathBuf::from(&path);
+    if !target.is_file() {
+        return Err(format!("图片文件不存在: {}", target.display()));
+    }
+
+    let mime_type = image_mime_type(&target)
+        .ok_or_else(|| format!("不支持的图片格式: {}", target.display()))?;
+    let bytes = fs::read(&target)
+        .map_err(|err| format!("无法读取图片文件 {}: {err}", target.display()))?;
+    let encoded = BASE64_STANDARD.encode(bytes);
+    Ok(format!("data:{mime_type};base64,{encoded}"))
+}
+
+#[tauri::command]
+fn ensure_temporary_document_path(app: AppHandle, tab_id: String) -> Result<String, String> {
+    let temp_path = temp_doc_path(&app, &tab_id)?;
+    let parent = temp_path
+        .parent()
+        .ok_or_else(|| format!("无法定位临时文档目录: {}", temp_path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("无法创建临时文档目录 {}: {err}", parent.display()))?;
+    Ok(normalize(temp_path))
+}
+
+#[tauri::command]
+fn save_temporary_markdown_file(
+    app: AppHandle,
+    tab_id: String,
+    path: String,
+    content: String,
+) -> Result<String, String> {
+    let target_path = PathBuf::from(&path);
+    if !is_markdown(&target_path) {
+        return Err(format!("仅支持 Markdown 文件: {path}"));
+    }
+
+    let temp_path = temp_doc_path(&app, &tab_id)?;
+    let temp_dir = temp_path
+        .parent()
+        .ok_or_else(|| format!("无法定位临时文档目录: {}", temp_path.display()))?;
+    let rewritten = copy_temp_assets_and_rewrite(temp_dir, &temp_path, &target_path, &content)?;
+    write_file(&path, &rewritten)?;
+
+    if temp_dir.exists() {
+        fs::remove_dir_all(temp_dir)
+            .map_err(|err| format!("无法清理临时文档目录 {}: {err}", temp_dir.display()))?;
+    }
+
+    let legacy_path = legacy_temp_doc_path(&app, &tab_id)?;
+    if legacy_path.exists() {
+        fs::remove_file(&legacy_path)
+            .map_err(|err| format!("无法清理旧临时文档 {}: {err}", legacy_path.display()))?;
+    }
+
+    Ok(rewritten)
+}
+
+#[tauri::command]
+fn save_image_asset(
+    document_path: String,
+    assets_dir: String,
+    file_name: Option<String>,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    let document = PathBuf::from(&document_path);
+    if !is_markdown(&document) {
+        return Err(format!("仅支持为 Markdown 文档保存图片: {document_path}"));
+    }
+
+    let document_dir = document
+        .parent()
+        .ok_or_else(|| format!("无法定位文档目录: {}", document.display()))?;
+    let relative_dir = sanitize_image_dir(&assets_dir)?;
+    let target_dir = document_dir.join(&relative_dir);
+    fs::create_dir_all(&target_dir)
+        .map_err(|err| format!("无法创建图片目录 {}: {err}", target_dir.display()))?;
+
+    let target_path = build_unique_image_path(&target_dir, file_name.as_deref());
+    fs::write(&target_path, bytes)
+        .map_err(|err| format!("无法写入图片文件 {}: {err}", target_path.display()))?;
+
+    let relative_path = target_path
+        .strip_prefix(document_dir)
+        .map_err(|err| format!("无法计算图片相对路径 {}: {err}", target_path.display()))?;
+
+    Ok(relative_path.to_string_lossy().replace('\\', "/"))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -645,7 +996,11 @@ fn main() {
             load_editor_session,
             save_editor_session,
             open_external_url,
-            open_file_location
+            open_file_location,
+            read_image_data_url,
+            ensure_temporary_document_path,
+            save_temporary_markdown_file,
+            save_image_asset
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

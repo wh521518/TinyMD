@@ -68,8 +68,11 @@ button {
 }
 
 .toc-pane {
-  border-right: 0;
-  min-width: 0;
+  flex: 0 0 224px;
+  width: 224px;
+  min-width: 180px;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
 }
 
 .pane-header {
@@ -82,6 +85,17 @@ button {
   padding: 0 6px;
   border-bottom: 0;
   background: var(--panel-2);
+}
+
+.pane-header--caption {
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pane-header__label {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 30px;
 }
 
 .pane-header h1,
@@ -102,6 +116,11 @@ button {
 .header-actions {
   position: relative;
   z-index: 1;
+}
+
+.header-menu {
+  position: relative;
+  display: flex;
 }
 
 .toolbar-title {
@@ -154,6 +173,39 @@ button {
   color: var(--text);
   font-size: 12px;
   line-height: 30px;
+}
+
+.menu-button.is-active {
+  background: var(--hover);
+}
+
+.menu-popup {
+  position: absolute;
+  top: calc(100% + 1px);
+  left: 0;
+  z-index: 40;
+  min-width: 128px;
+  padding: 3px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel);
+  box-shadow: 0 10px 18px rgba(0, 0, 0, 0.1);
+}
+
+.menu-popup__item {
+  display: block;
+  width: 100%;
+  min-height: 24px;
+  padding: 0 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 24px;
+  text-align: left;
+}
+
+.menu-popup__item.is-active,
+.menu-popup__item:hover {
+  background: var(--hover);
 }
 
 .primary-button:hover,
@@ -214,7 +266,7 @@ button {
 }
 
 .tree-item.is-selected,
-.toc-item,
+.toc-item.is-active,
 .tab-chip.is-active {
   background: var(--panel-2);
 }
@@ -326,26 +378,37 @@ button {
 
 .editor-shell {
   overflow: auto;
-  padding-left: 48px;
+  padding: 16px 18px 72px 48px;
+  box-sizing: border-box;
+}
+
+.editor-shell.is-empty {
+  overflow: hidden;
+  padding: 0;
 }
 
 .editor-host {
-  min-height: 100%;
+  box-sizing: border-box;
 }
 
 .editor-source {
-  overflow: hidden;
+  overflow: auto;
+  padding: 16px 18px 72px 48px;
+  box-sizing: border-box;
 }
 
 .editor-source__textarea {
   width: 100%;
-  height: 100%;
-  padding: 16px 18px 72px 48px;
+  min-height: 100%;
+  height: auto;
+  padding: 0;
   border: 0;
   outline: none;
   resize: none;
   background: var(--panel);
   color: var(--text);
+  box-sizing: border-box;
+  display: block;
   font-family: var(--font-source);
   font-size: 14px;
   line-height: 1.6;
@@ -445,23 +508,34 @@ button {
 }
 
 .toc-item {
-  min-height: 30px;
-  padding: 4px 10px;
+  min-height: 26px;
+  padding: 3px 10px;
   margin-bottom: 0;
   text-align: left;
 }
 
 .toc-item__level {
-  min-width: 24px;
+  min-width: 22px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 10px;
+  line-height: 1;
+  text-transform: uppercase;
 }
 
 .toc-item__text {
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 12px;
+}
+
+.toc-empty {
+  padding: 10px 12px;
+}
+
+.toc-item.is-active .toc-item__level {
+  color: var(--text);
 }
 
 .toc-proxy {
@@ -493,10 +567,13 @@ button {
   --crepe-shadow-2: none;
   min-height: 100%;
   background: var(--panel);
+  box-sizing: border-box;
 }
 
 .milkdown .editor {
-  padding: 16px 18px 72px 12px;
+  min-height: 100%;
+  padding: 0;
+  box-sizing: border-box;
 }
 
 .milkdown .ProseMirror.virtual-cursor-enabled.editor {
@@ -512,7 +589,9 @@ button {
 .milkdown .ProseMirror h1,
 .milkdown .ProseMirror h2,
 .milkdown .ProseMirror h3,
-.milkdown .ProseMirror h4 {
+.milkdown .ProseMirror h4,
+.milkdown .ProseMirror h5,
+.milkdown .ProseMirror h6 {
   font-family: var(--font-title);
   color: var(--text);
 }
@@ -556,13 +635,22 @@ button {
   margin-bottom: 4px;
 }
 
+.milkdown .milkdown-code-block .tools .tools-button-group,
 .milkdown .milkdown-code-block .tools .language-button,
 .milkdown .milkdown-code-block .tools .tools-button-group button {
-  opacity: 1;
+  opacity: 1 !important;
+  visibility: visible !important;
 }
 
 .milkdown .milkdown-code-block .tools .language-button {
-  margin-bottom: 0;
+  margin-bottom: 0 !important;
+}
+
+.milkdown .milkdown-code-block:hover .tools .language-button,
+.milkdown .milkdown-code-block:hover .tools .tools-button-group button,
+.milkdown .milkdown-code-block .tools .language-button[data-expanded="true"] {
+  opacity: 1 !important;
+  visibility: visible !important;
 }
 
 .milkdown .milkdown-code-block .cm-editor,
@@ -604,6 +692,55 @@ button {
   background: rgba(17, 17, 17, 0.14) !important;
 }
 
+.milkdown .milkdown-image-block .image-wrapper .operation {
+  gap: 10px;
+  right: 10px;
+  top: 10px;
+}
+
+.milkdown .milkdown-image-block {
+  margin: 0 !important;
+}
+
+.milkdown .milkdown-image-block > .caption-input {
+  margin: 0 auto !important;
+}
+
+.milkdown .milkdown-image-block .image-wrapper .operation > .operation-item {
+  width: 40px;
+  height: 40px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.14);
+  opacity: 0.88;
+}
+
+.milkdown .milkdown-image-block .image-wrapper .operation > .operation-item svg {
+  width: 22px;
+  height: 22px;
+}
+
+.milkdown .milkdown-image-block .image-wrapper .image-resize-handle {
+  height: 12px !important;
+  bottom: -8px !important;
+  max-width: 220px;
+  border: 2px solid var(--panel) !important;
+  background: #8f8f8f;
+  opacity: 0.72;
+  border-radius: 999px;
+  cursor: ew-resize;
+}
+
+.milkdown .milkdown-image-block.selected > .image-wrapper .operation,
+.milkdown .milkdown-image-block.selected > .image-wrapper .image-resize-handle {
+  opacity: 1;
+}
+
+.milkdown .milkdown-block-handle {
+  transform: translate(8px, 4px);
+  transition: opacity 0.18s ease;
+}
+
 .milkdown .milkdown-block-handle.custom-block-handle[data-show="false"] {
   opacity: 0;
   pointer-events: none;
@@ -617,8 +754,6 @@ button {
   align-items: flex-start;
   gap: 8px;
   width: max-content;
-  transform: translate(8px, 4px);
-  transition: opacity 0.18s ease;
 }
 
 .milkdown
