@@ -1,6 +1,6 @@
 [package]
 name = "rust-milkdown"
-version = "0.1.0"
+version = "1.0.0-beat.1"
 description = "A Tauri Markdown editor powered by Milkdown"
 authors = ["Codex"]
 edition = "2021"
