@@ -956,6 +956,27 @@ fn save_temporary_markdown_file(
 }
 
 #[tauri::command]
+fn delete_temporary_document(app: AppHandle, tab_id: String) -> Result<(), String> {
+    let temp_path = temp_doc_path(&app, &tab_id)?;
+    let temp_dir = temp_path
+        .parent()
+        .ok_or_else(|| format!("无法定位临时文档目录: {}", temp_path.display()))?;
+
+    if temp_dir.exists() {
+        fs::remove_dir_all(temp_dir)
+            .map_err(|err| format!("无法清理临时文档目录 {}: {err}", temp_dir.display()))?;
+    }
+
+    let legacy_path = legacy_temp_doc_path(&app, &tab_id)?;
+    if legacy_path.exists() {
+        fs::remove_file(&legacy_path)
+            .map_err(|err| format!("无法清理旧临时文档 {}: {err}", legacy_path.display()))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 fn save_image_asset(
     document_path: String,
     assets_dir: String,
@@ -1000,6 +1021,7 @@ fn main() {
             read_image_data_url,
             ensure_temporary_document_path,
             save_temporary_markdown_file,
+            delete_temporary_document,
             save_image_asset
         ])
         .run(tauri::generate_context!())

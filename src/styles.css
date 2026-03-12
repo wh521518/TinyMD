@@ -384,7 +384,6 @@ button {
 
 .editor-shell.is-empty {
   overflow: hidden;
-  padding: 0;
 }
 
 .editor-host {

@@ -11,7 +11,7 @@ import {
   type DragEvent as ReactDragEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { message as showDialogMessage, open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TabsBar } from "./components/TabsBar";
 import type { EditorTab } from "./types";
@@ -276,6 +276,11 @@ type UiText = {
   imageRequiresSavedDocument: string;
   imageInsertFailed: (error: string) => string;
   imageInserted: (name: string) => string;
+  confirmCloseDirtyTab: (title: string) => string;
+  confirmCloseDirtyWindow: (count: number) => string;
+  unsavedSave: string;
+  unsavedDiscard: string;
+  unsavedCancel: string;
 };
 
 const UI_TEXT: Record<UiLanguage, UiText> = {
@@ -346,6 +351,12 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     imageRequiresSavedDocument: "请先保存当前文档，再插入图片。",
     imageInsertFailed: (error) => `插入图片失败：${error}`,
     imageInserted: (name) => `已插入图片 ${name}`,
+    confirmCloseDirtyTab: (title) => `“${title}”尚未保存。关闭前先保存吗？`,
+    confirmCloseDirtyWindow: (count) =>
+      `当前有 ${count} 个未保存文档。关闭应用前先保存吗？`,
+    unsavedSave: "保存",
+    unsavedDiscard: "不保存",
+    unsavedCancel: "取消",
   },
   "en-US": {
     menuOpen: "Open(O)",
@@ -414,6 +425,12 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     imageRequiresSavedDocument: "Save the current document before inserting images.",
     imageInsertFailed: (error) => `Failed to insert image: ${error}`,
     imageInserted: (name) => `Inserted image ${name}`,
+    confirmCloseDirtyTab: (title) => `“${title}” has unsaved changes. Save before closing?`,
+    confirmCloseDirtyWindow: (count) =>
+      `${count} document(s) have unsaved changes. Save before closing the app?`,
+    unsavedSave: "Save",
+    unsavedDiscard: "Don't Save",
+    unsavedCancel: "Cancel",
   },
 };
 
@@ -626,6 +643,7 @@ export default function App() {
   const internalDragRef = useRef(false);
   const tabsRef = useRef<EditorTab[]>([]);
   const activeTabIdRef = useRef<string | null>(null);
+  const allowWindowCloseRef = useRef(false);
   const loadingTabIdsRef = useRef(new Set<string>());
   const sessionReadyRef = useRef(false);
   const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
@@ -660,6 +678,30 @@ export default function App() {
     () => (activeTab?.loaded ? extractOutlineItems(activeTab.content) : []),
     [activeTab?.loaded, activeTab?.content],
   );
+
+  const promptUnsavedDecision = async (
+    messageText: string,
+  ): Promise<"save" | "discard" | "cancel"> => {
+    const result = await showDialogMessage(messageText, {
+      title: APP_NAME,
+      kind: "warning",
+      buttons: {
+        yes: t.unsavedSave,
+        no: t.unsavedDiscard,
+        cancel: t.unsavedCancel,
+      },
+    });
+
+    if (result === t.unsavedSave) {
+      return "save";
+    }
+
+    if (result === t.unsavedDiscard) {
+      return "discard";
+    }
+
+    return "cancel";
+  };
 
   useEffect(() => {
     tabsRef.current = tabs;
@@ -813,12 +855,12 @@ export default function App() {
 
   const handleSaveTab = async (tab = activeTab) => {
     if (!tab) {
-      return;
+      return false;
     }
 
     if (!tab.loaded) {
       setMessage(t.loadingBeforeSave(tab.title));
-      return;
+      return false;
     }
 
     setBusy(true);
@@ -834,7 +876,7 @@ export default function App() {
 
         if (!result || Array.isArray(result)) {
           setMessage(t.saveCanceled);
-          return;
+          return false;
         }
 
         targetPath = String(result);
@@ -845,7 +887,7 @@ export default function App() {
       );
       if (conflict) {
         setMessage(t.saveConflict(getFileName(targetPath)));
-        return;
+        return false;
       }
 
       const nextContent = tab.temporary
@@ -882,21 +924,87 @@ export default function App() {
       );
       setActiveTabId(targetPath);
       setMessage(t.saveSuccess(getFileName(targetPath)));
+      return true;
     } catch (error) {
       setMessage(t.saveFailed(String(error)));
+      return false;
     } finally {
       setBusy(false);
     }
   };
 
-  const handleCloseTab = (id: string) => {
+  const closeTabImmediately = (id: string) => {
     setTabs((current) => {
       const next = current.filter((tab) => tab.id !== id);
-      if (activeTabId === id) {
+      if (activeTabIdRef.current === id) {
         setActiveTabId(next.length > 0 ? next[next.length - 1].id : null);
       }
       return next;
     });
+  };
+
+  const cleanupTemporaryTab = async (tab: EditorTab) => {
+    if (!tab.temporary) {
+      return;
+    }
+
+    await invoke("delete_temporary_document", {
+      tabId: tab.id,
+    }).catch(() => {});
+  };
+
+  const handleCloseTab = async (id: string) => {
+    const targetTab = tabsRef.current.find((tab) => tab.id === id);
+    if (!targetTab) {
+      return;
+    }
+
+    if (targetTab.dirty) {
+      const decision = await promptUnsavedDecision(
+        t.confirmCloseDirtyTab(targetTab.title),
+      );
+      if (decision === "cancel") {
+        return;
+      }
+
+      if (decision === "save") {
+        const saved = await handleSaveTab(targetTab);
+        if (!saved) {
+          return;
+        }
+      } else {
+        await cleanupTemporaryTab(targetTab);
+      }
+    }
+
+    closeTabImmediately(targetTab.id);
+  };
+
+  const saveDirtyTabsBeforeWindowClose = async () => {
+    const dirtyTabs = tabsRef.current.filter((tab) => tab.dirty);
+    if (dirtyTabs.length === 0) {
+      return true;
+    }
+
+    const decision = await promptUnsavedDecision(
+      t.confirmCloseDirtyWindow(dirtyTabs.length),
+    );
+    if (decision === "cancel") {
+      return false;
+    }
+
+    if (decision === "save") {
+      for (const tab of dirtyTabs) {
+        const saved = await handleSaveTab(tab);
+        if (!saved) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    await Promise.all(dirtyTabs.map((tab) => cleanupTemporaryTab(tab)));
+    return true;
   };
 
   const handleCreateDocument = () => {
@@ -1050,6 +1158,37 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
   }, [language]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    void getCurrentWindow()
+      .onCloseRequested(async (event) => {
+        if (allowWindowCloseRef.current) {
+          return;
+        }
+
+        event.preventDefault();
+        const canClose = await saveDirtyTabsBeforeWindowClose();
+        if (!canClose) {
+          return;
+        }
+
+        allowWindowCloseRef.current = true;
+        try {
+          await getCurrentWindow().close();
+        } finally {
+          allowWindowCloseRef.current = false;
+        }
+      })
+      .then((dispose) => {
+        unlisten = dispose;
+      });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [saveDirtyTabsBeforeWindowClose]);
 
   useEffect(() => {
     if (!showOutline || editorMode !== "source") {
@@ -1604,7 +1743,7 @@ export default function App() {
       return;
     }
 
-    handleCloseTab(contextMenuTab.id);
+    void handleCloseTab(contextMenuTab.id);
     setTabContextMenu(null);
   };
 
@@ -1809,13 +1948,6 @@ export default function App() {
             >
               {t.menuSave}
             </button>
-            <button
-              type="button"
-              className="menu-button"
-              onClick={handleConfigureImageFolder}
-            >
-              {t.menuImages}
-            </button>
             <div className="header-menu" ref={languageMenuRef}>
               <button
                 type="button"
@@ -1853,7 +1985,9 @@ export default function App() {
           tabs={tabs}
           activeTabId={activeTabId}
           onActivate={setActiveTabId}
-          onClose={handleCloseTab}
+          onClose={(id) => {
+            void handleCloseTab(id);
+          }}
           onContextMenu={(tab, position) =>
             setTabContextMenu({
               tabId: tab.id,
