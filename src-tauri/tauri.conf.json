@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "TinyMD",
-  "version": "1.0.0-beat.1",
+  "version": "1.0.0-beat.2",
   "identifier": "com.codex.rust-milkdown",
   "build": {
     "beforeDevCommand": "npm run dev",
