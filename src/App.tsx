@@ -743,6 +743,24 @@ export default function App() {
     return "cancel";
   };
 
+  const saveEditorSessionSnapshot = useEffectEvent(async (
+    sessionTabs = tabsRef.current,
+    sessionActiveTabId = activeTabIdRef.current,
+  ) => {
+    try {
+      await invoke("save_editor_session", {
+        session: {
+          tabs: sessionTabs,
+          activeTabId: sessionActiveTabId,
+        },
+      });
+      return true;
+    } catch (error) {
+      setMessage(t.saveSessionFailed(String(error)));
+      return false;
+    }
+  });
+
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
@@ -1020,36 +1038,9 @@ export default function App() {
     closeTabImmediately(targetTab.id);
   };
 
-  const saveDirtyTabsBeforeWindowClose = async () => {
-    const dirtyTabs = tabsRef.current.filter((tab) => tab.dirty);
-    if (dirtyTabs.length === 0) {
-      return true;
-    }
-
-    const decision = await promptUnsavedDecision(
-      t.confirmCloseDirtyWindow(dirtyTabs.length),
-    );
-    if (decision === "cancel") {
-      return false;
-    }
-
-    if (decision === "save") {
-      for (const tab of dirtyTabs) {
-        const saved = await handleSaveTab(tab);
-        if (!saved) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    await Promise.all(dirtyTabs.map((tab) => cleanupTemporaryTab(tab)));
-    return true;
-  };
-
   const exitApplication = async () => {
-    const canClose = await saveDirtyTabsBeforeWindowClose();
-    if (!canClose) {
+    const persisted = await saveEditorSessionSnapshot();
+    if (!persisted) {
       return;
     }
 
@@ -1520,14 +1511,7 @@ export default function App() {
     }
 
     const timer = window.setTimeout(() => {
-      void invoke("save_editor_session", {
-        session: {
-          tabs,
-          activeTabId,
-        },
-      }).catch((error) => {
-        setMessage(t.saveSessionFailed(String(error)));
-      });
+      void saveEditorSessionSnapshot(tabs, activeTabId);
     }, 250);
 
     return () => window.clearTimeout(timer);
