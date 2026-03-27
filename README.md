@@ -36,6 +36,40 @@ npm run tauri build
 
 This command generates platform-specific desktop bundles or executables based on the current Tauri configuration.
 
+## 版本与发布约定 / Versioning & Release
+
+- 当前使用 `beat` 节奏版本号：`1.0.0-beat.N`
+- Git tag 统一使用带 `v` 前缀的同版本号：`v1.0.0-beat.N`
+- 每次发布时，以下文件中的版本号必须保持一致：
+  - `package.json`
+  - `package-lock.json`
+  - `src-tauri/Cargo.toml`
+  - `src-tauri/Cargo.lock`
+  - `src-tauri/tauri.conf.json`
+- 每次发布都要在 [CHANGELOG.md](./CHANGELOG.md) 增加对应版本摘要
+- 建议的发布提交信息：
+  - 版本提交：`Release beat.N`
+  - 如果构建后 `Cargo.lock` 发生同步变更，可单独提交：`chore: sync Cargo.lock for beat.N`
+
+当前仓库默认只保证 `exe` 产物发布流程：
+
+```bash
+npx tauri build --no-bundle
+```
+
+- `beat.N` 这种预发布版本号可以正常生成 `exe`
+- 但 Windows MSI 不接受 `beat.5` 这类预发布标识，因此当前 `beat` 版本默认不生成 MSI
+- 如果后续需要 MSI，必须先改成 Windows MSI 可接受的版本规则
+
+Recommended release sequence:
+
+1. Update the version files listed above to `1.0.0-beat.N`
+2. Add a matching entry to `CHANGELOG.md`
+3. Commit the release changes
+4. Build the executable with `npx tauri build --no-bundle`
+5. Create the git tag `v1.0.0-beat.N`
+6. Publish the built `.exe` through GitHub Release if needed
+
 ## License
 
 MIT
