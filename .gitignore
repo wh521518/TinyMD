@@ -8,6 +8,7 @@ Thumbs.db
 
 .vscode/
 .idea/
+.codex/
 
 *.log
 node_modules
