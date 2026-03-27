@@ -208,6 +208,76 @@ button {
   background: var(--hover);
 }
 
+.app-confirm-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 180;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.app-confirm-dialog {
+  width: min(420px, calc(100vw - 32px));
+  border: 1px solid #b8b8b8;
+  background: #f3f3f3;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+}
+
+.app-confirm-dialog__titlebar {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 12px;
+  border-bottom: 1px solid #d0d0d0;
+  background: #f7f7f7;
+  color: #111111;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.app-confirm-dialog__body {
+  padding: 18px 20px 12px;
+  background: #f3f3f3;
+}
+
+.app-confirm-dialog__body p {
+  margin: 0;
+  color: #1a1a1a;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.app-confirm-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 20px 18px;
+  background: #f3f3f3;
+}
+
+.app-confirm-dialog__button {
+  min-width: 78px;
+}
+
+.app-confirm-dialog__button.primary-button {
+  background: #0067c0;
+  border-color: #005ea6;
+}
+
+.app-confirm-dialog__button.primary-button:hover {
+  background: #005ea6;
+  border-color: #00538f;
+}
+
+.app-confirm-dialog__button:focus-visible {
+  outline: 2px solid #5b9dd9;
+  outline-offset: 1px;
+}
+
 .primary-button:hover,
 .ghost-button:hover,
 .menu-button:hover,
@@ -331,7 +401,8 @@ button {
   font-size: 14px;
 }
 
-.tab-context-menu {
+.tab-context-menu,
+.attachment-context-menu {
   position: fixed;
   z-index: 120;
   min-width: 126px;
@@ -341,7 +412,8 @@ button {
   box-shadow: 0 10px 18px rgba(0, 0, 0, 0.1);
 }
 
-.tab-context-menu__item {
+.tab-context-menu__item,
+.attachment-context-menu__item {
   display: block;
   width: 100%;
   min-height: 24px;
@@ -353,11 +425,13 @@ button {
   text-align: left;
 }
 
-.tab-context-menu__item:hover {
+.tab-context-menu__item:hover,
+.attachment-context-menu__item:hover {
   background: var(--hover);
 }
 
-.tab-context-menu__item:disabled {
+.tab-context-menu__item:disabled,
+.attachment-context-menu__item:disabled {
   color: var(--text-muted);
   cursor: not-allowed;
 }
@@ -605,6 +679,164 @@ button {
   border-left: 2px solid var(--border-strong);
   margin-left: 0;
   padding-left: 12px;
+}
+
+.milkdown .tinymd-attachment-block {
+  display: block;
+  width: 100%;
+  max-width: none;
+  margin: 6px 0;
+}
+
+.milkdown .milkdown-list-item-block .tinymd-attachment-block {
+  margin: 0;
+}
+
+.milkdown .tinymd-attachment-block__surface {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  width: min(100%, 360px);
+  padding: 10px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+  color: var(--text);
+  text-align: left;
+  box-shadow: none;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.milkdown .tinymd-attachment-block__surface:hover {
+  background: linear-gradient(180deg, #ffffff 0%, #f5f8fc 100%);
+  border-color: #aebdce;
+}
+
+.milkdown .tinymd-attachment-block[data-import-status="queued"] .tinymd-attachment-block__surface {
+  border-style: dashed;
+  border-color: #7aa7d8;
+  cursor: progress;
+}
+
+.milkdown .tinymd-attachment-block[data-import-status="queued"] .tinymd-attachment-block__icon {
+  position: relative;
+}
+
+.milkdown .tinymd-attachment-block[data-import-status="queued"] .tinymd-attachment-block__icon::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 2px solid rgba(41, 121, 213, 0.32);
+  border-top-color: rgba(41, 121, 213, 0.78);
+  border-radius: 999px;
+  animation: tinymd-attachment-spin 1s linear infinite;
+}
+
+.milkdown .tinymd-attachment-block[data-import-status="failed"] .tinymd-attachment-block__surface {
+  border-color: #d1495b;
+  background: linear-gradient(180deg, #fff8f8 0%, #fff1f1 100%);
+}
+
+.milkdown .tinymd-attachment-block[data-import-status="failed"] .tinymd-attachment-block__meta {
+  color: #b54755;
+}
+
+.milkdown .tinymd-attachment-block__surface:focus-visible {
+  outline: 2px solid #7aa7d8;
+  outline-offset: 2px;
+}
+
+.milkdown .tinymd-attachment-block__icon {
+  display: inline-flex;
+  flex: 0 0 32px;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  background: #2979d5;
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.milkdown .tinymd-attachment-block__body {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+.milkdown .tinymd-attachment-block__title,
+.milkdown .tinymd-attachment-block__meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.milkdown .tinymd-attachment-block__title {
+  font-size: 14px;
+  line-height: 1.2;
+  font-weight: 600;
+}
+
+.milkdown .tinymd-attachment-block__meta {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.15;
+}
+
+.milkdown .tinymd-attachment-block[data-attachment-tone="archive"] .tinymd-attachment-block__icon {
+  background: #2979d5;
+}
+
+.milkdown .tinymd-attachment-block[data-attachment-tone="pdf"] .tinymd-attachment-block__icon {
+  background: #d1495b;
+}
+
+.milkdown .tinymd-attachment-block[data-attachment-tone="document"] .tinymd-attachment-block__icon {
+  background: #c48b32;
+}
+
+.milkdown .tinymd-attachment-block[data-attachment-tone="media"] .tinymd-attachment-block__icon {
+  background: #2f9e6d;
+}
+
+.milkdown .tinymd-attachment-block[data-attachment-tone="text"] .tinymd-attachment-block__icon {
+  background: #4f6d8d;
+}
+
+.milkdown .tinymd-attachment-block[data-attachment-tone="package"] .tinymd-attachment-block__icon {
+  background: #8a6438;
+}
+
+.milkdown .tinymd-attachment-block[data-attachment-tone="file"] .tinymd-attachment-block__icon {
+  background: #5c6f82;
+}
+
+.milkdown .tinymd-attachment-block.is-selected .tinymd-attachment-block__surface {
+  border-color: #7aa7d8;
+  box-shadow: 0 0 0 1px rgba(122, 167, 216, 0.28);
+}
+
+@keyframes tinymd-attachment-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.milkdown .ProseMirror-gapcursor:after {
+  width: 24px;
+  border-top-color: #7aa7d8;
 }
 
 .milkdown .ProseMirror code {

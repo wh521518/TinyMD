@@ -46,6 +46,33 @@ const getFilterNodes = (ctx: Ctx) => {
   }
 };
 
+const getAncestorBlockNode = (
+  view: EditorView,
+  $pos: ResolvedPos,
+  typeName: string,
+): ActiveBlockNode | null => {
+  for (let depth = $pos.depth; depth > 0; depth -= 1) {
+    const ancestor = $pos.node(depth);
+    if (ancestor.type.name !== typeName) {
+      continue;
+    }
+
+    const ancestorPos = $pos.before(depth);
+    const element = view.nodeDOM(ancestorPos) as HTMLElement | null;
+    if (!element) {
+      continue;
+    }
+
+    return {
+      $pos: view.state.doc.resolve(ancestorPos),
+      node: ancestor,
+      el: element,
+    };
+  }
+
+  return null;
+};
+
 const selectRootNodeByCoords = (
   ctx: Ctx,
   coords: { x: number; y: number },
@@ -93,6 +120,13 @@ const selectRootNodeByCoords = (
 
     if (!node || !element) {
       return null;
+    }
+
+    if (node.type.name === "attachment") {
+      const listItemNode = getAncestorBlockNode(view, $pos, "list_item");
+      if (listItemNode) {
+        return listItemNode;
+      }
     }
 
     return { $pos, node, el: element };

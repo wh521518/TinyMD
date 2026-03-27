@@ -1,19 +1,24 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, DragDropEvent, Emitter, Manager, State, WebviewEvent, WindowEvent,
 };
 
 const STATE_DIR_NAME: &str = "editor-state";
@@ -21,23 +26,57 @@ const TEMP_DOCS_DIR_NAME: &str = "temp-docs";
 const SESSION_FILE_NAME: &str = "session.json";
 const APP_NAME: &str = "TinyMD";
 const LEGACY_FALLBACK_APP_NAMES: &[&str] = &["TinyMd", "rust-milkdown"];
-const DEFAULT_IMAGE_DIR: &str = "assets";
+const DEFAULT_IMAGE_DIR: &str = "_assets";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
 const TRAY_QUIT_ID: &str = "tray-quit";
 const TRAY_REQUEST_EXIT_EVENT: &str = "tray-request-exit";
 const APP_CLOSE_INTENT_EVENT: &str = "app-close-intent";
+const ASSET_IMPORT_STATUS_EVENT: &str = "asset-import-status";
+const OPEN_DROPPED_MARKDOWN_FILES_EVENT: &str = "open-dropped-markdown-files";
+const INSERT_DROPPED_ASSET_PATHS_EVENT: &str = "insert-dropped-asset-paths";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DropPositionPayload {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DroppedAssetPathsPayload {
+    paths: Vec<String>,
+    position: DropPositionPayload,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+enum TabStorageKind {
+    #[default]
+    Saved,
+    Draft,
+    TemporaryFile,
+    Recovered,
+}
+
+impl TabStorageKind {
+    fn uses_temporary_document_storage(self) -> bool {
+        !matches!(self, Self::Saved)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EditorTabState {
     id: String,
     path: Option<String>,
+    source_path: Option<String>,
     title: String,
     content: String,
     saved_content: String,
     dirty: bool,
-    temporary: bool,
+    storage_kind: TabStorageKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -60,17 +99,133 @@ struct LoadedEditorSessionState {
 struct LoadedEditorTabState {
     id: String,
     path: Option<String>,
+    source_path: Option<String>,
     title: String,
     content: String,
     saved_content: String,
     dirty: bool,
-    temporary: bool,
+    storage_kind: TabStorageKind,
     loaded: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEditorTabState {
+    id: String,
+    path: Option<String>,
+    source_path: Option<String>,
+    title: String,
+    content: String,
+    saved_content: String,
+    dirty: bool,
+    storage_kind: Option<TabStorageKind>,
+    temporary: Option<bool>,
+}
+
+fn infer_storage_kind(
+    id: &str,
+    storage_kind: Option<TabStorageKind>,
+    temporary: Option<bool>,
+) -> TabStorageKind {
+    if let Some(storage_kind) = storage_kind {
+        return storage_kind;
+    }
+
+    match temporary {
+        Some(false) => TabStorageKind::Saved,
+        Some(true) | None if id.starts_with("recovered:") => TabStorageKind::Recovered,
+        Some(true) | None if id.starts_with("temp:drop:") => TabStorageKind::TemporaryFile,
+        Some(true) | None => TabStorageKind::Draft,
+    }
+}
+
+fn infer_source_path(
+    path: &Option<String>,
+    source_path: Option<String>,
+    storage_kind: TabStorageKind,
+) -> Option<String> {
+    if source_path.is_some() {
+        return source_path;
+    }
+
+    if matches!(storage_kind, TabStorageKind::Saved) {
+        return path.clone();
+    }
+
+    None
+}
+
+impl<'de> Deserialize<'de> for EditorTabState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawEditorTabState::deserialize(deserializer)?;
+        let storage_kind = infer_storage_kind(&raw.id, raw.storage_kind, raw.temporary);
+        let path = raw.path;
+        let source_path = infer_source_path(&path, raw.source_path, storage_kind);
+        Ok(Self {
+            id: raw.id.clone(),
+            path,
+            source_path,
+            title: raw.title,
+            content: raw.content,
+            saved_content: raw.saved_content,
+            dirty: raw.dirty,
+            storage_kind,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAssetMetadata {
+    file_name: String,
+    size_bytes: u64,
+    modified_unix_ms: Option<u64>,
+    extension: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetDirectoryStatus {
+    path: String,
+    exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetImportStatusPayload {
+    document_path: String,
+    relative_path: String,
+    file_name: String,
+    status: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetUploadSession {
+    upload_id: String,
+    relative_path: String,
+    file_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAssetUpload {
+    document_path: String,
+    relative_path: String,
+    file_name: String,
+    temp_path: PathBuf,
+    target_path: PathBuf,
 }
 
 #[derive(Default)]
 struct AppLifecycleState {
     allow_exit: AtomicBool,
+    pending_asset_imports: Mutex<HashSet<PathBuf>>,
+    pending_asset_uploads: Mutex<HashMap<String, PendingAssetUpload>>,
+    next_upload_id: AtomicU64,
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -141,7 +296,7 @@ fn sanitize_image_dir(value: &str) -> Result<PathBuf, String> {
     Ok(sanitized)
 }
 
-fn sanitize_image_stem(value: &str) -> String {
+fn sanitize_asset_stem(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     for ch in value.trim().chars() {
         if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
@@ -161,34 +316,87 @@ fn sanitize_image_stem(value: &str) -> String {
     }
 }
 
-fn build_unique_image_path(target_dir: &Path, file_name: Option<&str>) -> PathBuf {
-    let preferred_name = file_name.unwrap_or("image.png");
+fn sanitize_asset_extension(value: &str) -> Option<String> {
+    let sanitized = value
+        .trim()
+        .trim_matches('.')
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized.to_ascii_lowercase())
+    }
+}
+
+fn build_unique_asset_path(
+    target_dir: &Path,
+    file_name: Option<&str>,
+    default_name: &str,
+    reserved_paths: Option<&HashSet<PathBuf>>,
+) -> PathBuf {
+    let preferred_name = file_name.unwrap_or(default_name);
     let preferred_path = Path::new(preferred_name);
     let stem = preferred_path
         .file_stem()
         .and_then(|value| value.to_str())
-        .map(sanitize_image_stem)
-        .unwrap_or_else(|| "image".to_string());
+        .map(sanitize_asset_stem)
+        .unwrap_or_else(|| "attachment".to_string());
     let extension = preferred_path
         .extension()
         .and_then(|value| value.to_str())
-        .filter(|value| is_supported_image_extension(value))
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_else(|| "png".to_string());
+        .and_then(sanitize_asset_extension);
 
     let mut index = 0usize;
     loop {
-        let file_name = if index == 0 {
-            format!("{stem}.{extension}")
-        } else {
-            format!("{stem}-{index}.{extension}")
+        let file_name = match extension.as_deref() {
+            Some(extension) if index == 0 => format!("{stem}.{extension}"),
+            Some(extension) => format!("{stem}-{index}.{extension}"),
+            None if index == 0 => stem.clone(),
+            None => format!("{stem}-{index}"),
         };
         let candidate = target_dir.join(file_name);
-        if !candidate.exists() {
+        if !candidate.exists()
+            && reserved_paths
+                .map(|paths| !paths.contains(&candidate))
+                .unwrap_or(true)
+        {
             return candidate;
         }
         index += 1;
     }
+}
+
+fn resolve_asset_directory_path(document_path: &str, assets_dir: &str) -> Result<(PathBuf, PathBuf), String> {
+    let document = PathBuf::from(document_path);
+    if !is_markdown(&document) {
+        return Err(format!("仅支持为 Markdown 文档保存附件: {document_path}"));
+    }
+
+    let document_dir = document
+        .parent()
+        .ok_or_else(|| format!("无法定位文档目录: {}", document.display()))?
+        .to_path_buf();
+    let relative_dir = sanitize_image_dir(assets_dir)?;
+    let target_dir = document_dir.join(relative_dir);
+    Ok((document_dir, target_dir))
+}
+
+fn resolve_asset_target_path(
+    document_path: &str,
+    assets_dir: &str,
+    file_name: Option<&str>,
+    default_name: &str,
+    reserved_paths: Option<&HashSet<PathBuf>>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let (document_dir, target_dir) = resolve_asset_directory_path(document_path, assets_dir)?;
+    fs::create_dir_all(&target_dir)
+        .map_err(|err| format!("无法创建资源目录 {}: {err}", target_dir.display()))?;
+
+    let target_path = build_unique_asset_path(&target_dir, file_name, default_name, reserved_paths);
+    Ok((document_dir, target_path))
 }
 
 fn legacy_state_dir() -> Result<PathBuf, String> {
@@ -340,6 +548,21 @@ fn session_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(state_dir(app)?.join(SESSION_FILE_NAME))
 }
 
+fn append_drag_debug_log(app: &AppHandle, label: &str, detail: &str) {
+    let Ok(log_path) = state_dir(app).map(|dir| dir.join("drag-debug.log")) else {
+        return;
+    };
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(file, "[{timestamp}] {label}: {detail}");
+    }
+}
+
 fn temp_file_name(tab_id: &str) -> String {
     let mut sanitized = String::with_capacity(tab_id.len());
     for ch in tab_id.chars() {
@@ -392,11 +615,12 @@ fn recover_file_tab(tab: &EditorTabState) -> EditorTabState {
     EditorTabState {
         id: recovered_tab_id(&tab.id),
         path: None,
-        title: recovered_tab_title(tab.path.as_deref(), &tab.title),
+        source_path: None,
+        title: recovered_tab_title(tab.source_path.as_deref().or(tab.path.as_deref()), &tab.title),
         content: tab.content.clone(),
         saved_content: tab.saved_content.clone(),
         dirty: true,
-        temporary: true,
+        storage_kind: TabStorageKind::Recovered,
     }
 }
 
@@ -404,11 +628,12 @@ fn into_loaded_tab(tab: EditorTabState, loaded: bool) -> LoadedEditorTabState {
     LoadedEditorTabState {
         id: tab.id,
         path: tab.path,
+        source_path: tab.source_path,
         title: tab.title,
         content: tab.content,
         saved_content: tab.saved_content,
         dirty: tab.dirty,
-        temporary: tab.temporary,
+        storage_kind: tab.storage_kind,
         loaded,
     }
 }
@@ -421,6 +646,7 @@ fn assign_temp_doc_path(app: &AppHandle, tab: &mut EditorTabState) -> Result<(),
 fn replace_asset_reference(content: String, old_path: &str, new_path: &str) -> String {
     content
         .replace(&format!("({old_path})"), &format!("({new_path})"))
+        .replace(&format!("(<{old_path}>)"), &format!("(<{new_path}>)"))
         .replace(&format!("\"{old_path}\""), &format!("\"{new_path}\""))
         .replace(&format!("'{old_path}'"), &format!("'{new_path}'"))
 }
@@ -489,9 +715,11 @@ fn copy_temp_assets_and_rewrite(
             })?;
 
             let final_destination = if destination_path.exists() {
-                build_unique_image_path(
+                build_unique_asset_path(
                     destination_dir,
                     destination_path.file_name().and_then(|value| value.to_str()),
+                    "attachment",
+                    None,
                 )
             } else {
                 destination_path
@@ -530,7 +758,11 @@ fn sync_temp_docs(app: &AppHandle, session: &EditorSessionState) -> Result<(), S
     let temp_dir = temp_docs_dir(app)?;
     let mut active_dirs = HashSet::new();
 
-    for tab in session.tabs.iter().filter(|tab| tab.temporary) {
+    for tab in session
+        .tabs
+        .iter()
+        .filter(|tab| tab.storage_kind.uses_temporary_document_storage())
+    {
         let tab_dir = temp_doc_dir_path(app, &tab.id)?;
         let file_path = tab_dir.join("document.md");
         fs::create_dir_all(&tab_dir)
@@ -683,7 +915,7 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
         let original_id = tab.id.clone();
         let is_requested_active = requested_active_id.as_deref() == Some(original_id.as_str());
 
-        if tab.temporary {
+        if tab.storage_kind.uses_temporary_document_storage() {
             if let Some(content) = read_temp_doc_content(&app, &tab.id)? {
                 tab.content = content;
             }
@@ -697,7 +929,7 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
             continue;
         }
 
-        let Some(path) = tab.path.clone() else {
+        let Some(path) = tab.source_path.clone() else {
             let mut recovered = recover_file_tab(&tab);
             assign_temp_doc_path(&app, &mut recovered)?;
             warnings.push(format!(
@@ -762,6 +994,7 @@ fn load_editor_session(app: AppHandle) -> Result<LoadedEditorSessionState, Strin
 
         tab.id = normalized_path.clone();
         tab.path = Some(normalized_path.clone());
+        tab.source_path = Some(normalized_path.clone());
         tab.title = title;
 
         if tab.dirty {
@@ -840,7 +1073,7 @@ fn save_editor_session(app: AppHandle, session: EditorSessionState) -> Result<()
     let session_path = session_file_path(&app)?;
     let mut persisted_session = session;
     for tab in &mut persisted_session.tabs {
-        if !tab.temporary && !tab.dirty {
+        if !tab.storage_kind.uses_temporary_document_storage() && !tab.dirty {
             tab.content.clear();
             tab.saved_content.clear();
         }
@@ -860,22 +1093,39 @@ fn open_external_url(url: String) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn reveal_path(path: &Path) -> Result<(), String> {
+    let to_windows_string = |value: PathBuf| value.to_string_lossy().replace('/', "\\");
+
     if path.exists() {
-        Command::new("explorer")
-            .args(["/select,", &path.to_string_lossy()])
+        let target = fs::canonicalize(path)
+            .map_err(|err| format!("无法解析路径 {}: {err}", path.display()))?;
+
+        if target.is_dir() {
+            return Command::new("explorer.exe")
+                .arg(to_windows_string(target.clone()))
+                .spawn()
+                .map(|_| ())
+                .map_err(|err| format!("无法打开目录 {}: {err}", target.display()));
+        }
+
+        let select_arg = format!("/select,{}", to_windows_string(target.clone()));
+        return Command::new("explorer.exe")
+            .arg(select_arg)
             .spawn()
             .map(|_| ())
-            .map_err(|err| format!("无法打开目录 {}: {err}", path.display()))
-    } else {
-        let parent = path
-            .parent()
-            .ok_or_else(|| format!("找不到目录: {}", path.display()))?;
-        Command::new("explorer")
-            .arg(parent)
-            .spawn()
-            .map(|_| ())
-            .map_err(|err| format!("无法打开目录 {}: {err}", parent.display()))
+            .map_err(|err| format!("无法打开目录 {}: {err}", target.display()));
     }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("找不到目录: {}", path.display()))?;
+    let target_dir = fs::canonicalize(parent)
+        .map_err(|err| format!("无法解析目录 {}: {err}", parent.display()))?;
+
+    Command::new("explorer.exe")
+        .arg(to_windows_string(target_dir.clone()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("无法打开目录 {}: {err}", target_dir.display()))
 }
 
 #[cfg(target_os = "macos")]
@@ -924,6 +1174,48 @@ fn read_image_data_url(path: String) -> Result<String, String> {
         .map_err(|err| format!("无法读取图片文件 {}: {err}", target.display()))?;
     let encoded = BASE64_STANDARD.encode(bytes);
     Ok(format!("data:{mime_type};base64,{encoded}"))
+}
+
+#[tauri::command]
+fn read_local_asset_metadata(path: String) -> Result<LocalAssetMetadata, String> {
+    let target = PathBuf::from(&path);
+    if !target.is_file() {
+        return Err(format!("附件文件不存在: {}", target.display()));
+    }
+
+    let metadata = fs::metadata(&target)
+        .map_err(|err| format!("无法读取附件信息 {}: {err}", target.display()))?;
+    let modified_unix_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64);
+
+    Ok(LocalAssetMetadata {
+        file_name: target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        size_bytes: metadata.len(),
+        modified_unix_ms,
+        extension: target
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase()),
+    })
+}
+
+#[tauri::command]
+fn get_asset_directory_status(
+    document_path: String,
+    assets_dir: String,
+) -> Result<AssetDirectoryStatus, String> {
+    let (_, target_dir) = resolve_asset_directory_path(&document_path, &assets_dir)?;
+    Ok(AssetDirectoryStatus {
+        path: target_dir.to_string_lossy().to_string(),
+        exists: target_dir.is_dir(),
+    })
 }
 
 #[tauri::command]
@@ -992,34 +1284,405 @@ fn delete_temporary_document(app: AppHandle, tab_id: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn save_image_asset(
+fn save_asset(
     document_path: String,
     assets_dir: String,
     file_name: Option<String>,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
-    let document = PathBuf::from(&document_path);
-    if !is_markdown(&document) {
-        return Err(format!("仅支持为 Markdown 文档保存图片: {document_path}"));
-    }
+    let default_name = if file_name
+        .as_deref()
+        .map(|name| {
+            Path::new(name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .filter(|value| is_supported_image_extension(value))
+                .is_some()
+        })
+        .unwrap_or(false)
+    {
+        "image.png"
+    } else {
+        "attachment.bin"
+    };
 
-    let document_dir = document
-        .parent()
-        .ok_or_else(|| format!("无法定位文档目录: {}", document.display()))?;
-    let relative_dir = sanitize_image_dir(&assets_dir)?;
-    let target_dir = document_dir.join(&relative_dir);
-    fs::create_dir_all(&target_dir)
-        .map_err(|err| format!("无法创建图片目录 {}: {err}", target_dir.display()))?;
-
-    let target_path = build_unique_image_path(&target_dir, file_name.as_deref());
+    let (document_dir, target_path) = resolve_asset_target_path(
+        &document_path,
+        &assets_dir,
+        file_name.as_deref(),
+        default_name,
+        None,
+    )?;
     fs::write(&target_path, bytes)
-        .map_err(|err| format!("无法写入图片文件 {}: {err}", target_path.display()))?;
+        .map_err(|err| format!("无法写入附件文件 {}: {err}", target_path.display()))?;
 
     let relative_path = target_path
-        .strip_prefix(document_dir)
-        .map_err(|err| format!("无法计算图片相对路径 {}: {err}", target_path.display()))?;
+        .strip_prefix(&document_dir)
+        .map_err(|err| format!("无法计算附件相对路径 {}: {err}", target_path.display()))?;
 
     Ok(relative_path.to_string_lossy().replace('\\', "/"))
+}
+
+#[tauri::command]
+fn save_asset_from_path(
+    document_path: String,
+    assets_dir: String,
+    source_path: String,
+    file_name: Option<String>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err(format!("附件源文件不存在: {}", source.display()));
+    }
+
+    let default_name = if file_name
+        .as_deref()
+        .or_else(|| source.file_name().and_then(|value| value.to_str()))
+        .map(|name| {
+            Path::new(name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .filter(|value| is_supported_image_extension(value))
+                .is_some()
+        })
+        .unwrap_or(false)
+    {
+        "image.png"
+    } else {
+        "attachment.bin"
+    };
+
+    let effective_file_name = file_name
+        .as_deref()
+        .or_else(|| source.file_name().and_then(|value| value.to_str()));
+    let (document_dir, target_path) = resolve_asset_target_path(
+        &document_path,
+        &assets_dir,
+        effective_file_name,
+        default_name,
+        None,
+    )?;
+
+    fs::copy(&source, &target_path).map_err(|err| {
+        format!(
+            "无法复制附件文件 {} -> {}: {err}",
+            source.display(),
+            target_path.display()
+        )
+    })?;
+
+    let relative_path = target_path
+        .strip_prefix(&document_dir)
+        .map_err(|err| format!("无法计算附件相对路径 {}: {err}", target_path.display()))?;
+
+    Ok(relative_path.to_string_lossy().replace('\\', "/"))
+}
+
+#[tauri::command]
+fn begin_asset_upload(
+    lifecycle: State<AppLifecycleState>,
+    document_path: String,
+    assets_dir: String,
+    file_name: Option<String>,
+) -> Result<AssetUploadSession, String> {
+    let default_name = if file_name
+        .as_deref()
+        .map(|name| {
+            Path::new(name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .filter(|value| is_supported_image_extension(value))
+                .is_some()
+        })
+        .unwrap_or(false)
+    {
+        "image.png"
+    } else {
+        "attachment.bin"
+    };
+
+    let upload_id = format!(
+        "upload-{}",
+        lifecycle.next_upload_id.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let (target_path, relative_path, display_name, temp_path) = {
+        let mut reserved = lifecycle
+            .pending_asset_imports
+            .lock()
+            .map_err(|_| "无法锁定附件导入状态".to_string())?;
+        let (document_dir, target_path) = resolve_asset_target_path(
+            &document_path,
+            &assets_dir,
+            file_name.as_deref(),
+            default_name,
+            Some(&reserved),
+        )?;
+        reserved.insert(target_path.clone());
+
+        let relative_path = target_path
+            .strip_prefix(&document_dir)
+            .map_err(|err| format!("无法计算附件相对路径 {}: {err}", target_path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let display_name = file_name.clone().unwrap_or_else(|| {
+            target_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "attachment".to_string())
+        });
+        let temp_path = target_path.with_file_name(format!(".{upload_id}.part"));
+        (target_path, relative_path, display_name, temp_path)
+    };
+
+    if temp_path.exists() {
+        fs::remove_file(&temp_path)
+            .map_err(|err| format!("无法清理临时上传文件 {}: {err}", temp_path.display()))?;
+    }
+
+    lifecycle
+        .pending_asset_uploads
+        .lock()
+        .map_err(|_| "无法锁定附件上传状态".to_string())?
+        .insert(
+            upload_id.clone(),
+            PendingAssetUpload {
+                document_path,
+                relative_path: relative_path.clone(),
+                file_name: display_name.clone(),
+                temp_path,
+                target_path,
+            },
+        );
+
+    Ok(AssetUploadSession {
+        upload_id,
+        relative_path,
+        file_name: display_name,
+    })
+}
+
+#[tauri::command]
+fn append_asset_upload_chunk(
+    lifecycle: State<AppLifecycleState>,
+    upload_id: String,
+    base64_chunk: String,
+) -> Result<(), String> {
+    let temp_path = lifecycle
+        .pending_asset_uploads
+        .lock()
+        .map_err(|_| "无法锁定附件上传状态".to_string())?
+        .get(&upload_id)
+        .map(|upload| upload.temp_path.clone())
+        .ok_or_else(|| format!("找不到附件上传任务: {upload_id}"))?;
+    let bytes = BASE64_STANDARD
+        .decode(base64_chunk.as_bytes())
+        .map_err(|err| format!("无法解码附件上传分块: {err}"))?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&temp_path)
+        .map_err(|err| format!("无法打开临时上传文件 {}: {err}", temp_path.display()))?;
+    file.write_all(&bytes)
+        .map_err(|err| format!("无法写入临时上传文件 {}: {err}", temp_path.display()))
+}
+
+#[tauri::command]
+fn finish_asset_upload(
+    app: AppHandle,
+    lifecycle: State<AppLifecycleState>,
+    upload_id: String,
+    error: Option<String>,
+) -> Result<(), String> {
+    let pending = lifecycle
+        .pending_asset_uploads
+        .lock()
+        .map_err(|_| "无法锁定附件上传状态".to_string())?
+        .remove(&upload_id)
+        .ok_or_else(|| format!("找不到附件上传任务: {upload_id}"))?;
+
+    if let Ok(mut reserved) = lifecycle.pending_asset_imports.lock() {
+        reserved.remove(&pending.target_path);
+    }
+
+    let result = if let Some(reason) = error {
+        if pending.temp_path.exists() {
+            let _ = fs::remove_file(&pending.temp_path);
+        }
+        Err(reason)
+    } else {
+        fs::rename(&pending.temp_path, &pending.target_path).map_err(|err| {
+            format!(
+                "无法完成附件上传 {} -> {}: {err}",
+                pending.temp_path.display(),
+                pending.target_path.display()
+            )
+        })
+    };
+
+    let payload = match result {
+        Ok(()) => AssetImportStatusPayload {
+            document_path: pending.document_path,
+            relative_path: pending.relative_path,
+            file_name: pending.file_name,
+            status: "completed".to_string(),
+            error: None,
+        },
+        Err(err) => AssetImportStatusPayload {
+            document_path: pending.document_path,
+            relative_path: pending.relative_path,
+            file_name: pending.file_name,
+            status: "failed".to_string(),
+            error: Some(err),
+        },
+    };
+
+    let _ = app.emit(ASSET_IMPORT_STATUS_EVENT, payload);
+    Ok(())
+}
+
+#[tauri::command]
+fn queue_asset_import_from_path(
+    app: AppHandle,
+    lifecycle: State<AppLifecycleState>,
+    document_path: String,
+    assets_dir: String,
+    source_path: String,
+    file_name: Option<String>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err(format!("附件源文件不存在: {}", source.display()));
+    }
+
+    let default_name = if file_name
+        .as_deref()
+        .or_else(|| source.file_name().and_then(|value| value.to_str()))
+        .map(|name| {
+            Path::new(name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .filter(|value| is_supported_image_extension(value))
+                .is_some()
+        })
+        .unwrap_or(false)
+    {
+        "image.png"
+    } else {
+        "attachment.bin"
+    };
+
+    let effective_file_name = file_name
+        .as_deref()
+        .or_else(|| source.file_name().and_then(|value| value.to_str()));
+    let (target_path, relative_path, display_name) = {
+        let mut reserved = lifecycle
+            .pending_asset_imports
+            .lock()
+            .map_err(|_| "无法锁定附件导入状态".to_string())?;
+        let (document_dir, target_path) = resolve_asset_target_path(
+            &document_path,
+            &assets_dir,
+            effective_file_name,
+            default_name,
+            Some(&reserved),
+        )?;
+        reserved.insert(target_path.clone());
+
+        let relative_path = target_path
+            .strip_prefix(&document_dir)
+            .map_err(|err| format!("无法计算附件相对路径 {}: {err}", target_path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let display_name = effective_file_name
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                target_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "attachment".to_string())
+            });
+        (target_path, relative_path, display_name)
+    };
+
+    let event_app = app.clone();
+    let event_document_path = document_path.clone();
+    let event_relative_path = relative_path.clone();
+    std::thread::spawn(move || {
+        let copy_result = fs::copy(&source, &target_path).map(|_| ());
+
+        if let Ok(mut reserved) = event_app.state::<AppLifecycleState>().pending_asset_imports.lock() {
+            reserved.remove(&target_path);
+        }
+
+        let payload = match copy_result {
+            Ok(()) => AssetImportStatusPayload {
+                document_path: event_document_path,
+                relative_path: event_relative_path,
+                file_name: display_name,
+                status: "completed".to_string(),
+                error: None,
+            },
+            Err(err) => AssetImportStatusPayload {
+                document_path: event_document_path,
+                relative_path: event_relative_path,
+                file_name: display_name,
+                status: "failed".to_string(),
+                error: Some(format!(
+                    "无法复制附件文件 {} -> {}: {err}",
+                    source.display(),
+                    target_path.display()
+                )),
+            },
+        };
+
+        let _ = event_app.emit(ASSET_IMPORT_STATUS_EVENT, payload);
+    });
+
+    Ok(relative_path)
+}
+
+#[cfg(target_os = "windows")]
+fn launch_local_path(path: &Path) -> Result<(), String> {
+    Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("无法打开本地文件 {}: {err}", path.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_local_path(path: &Path) -> Result<(), String> {
+    Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("无法打开本地文件 {}: {err}", path.display()))
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn launch_local_path(path: &Path) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("无法打开本地文件 {}: {err}", path.display()))
+}
+
+#[tauri::command]
+fn open_local_path(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err(format!("本地文件不存在: {}", target.display()));
+    }
+
+    launch_local_path(&target)
 }
 
 #[tauri::command]
@@ -1103,14 +1766,77 @@ fn main() {
                 return;
             }
 
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                let lifecycle = window.state::<AppLifecycleState>();
-                if lifecycle.allow_exit.load(Ordering::SeqCst) {
-                    return;
-                }
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    let lifecycle = window.state::<AppLifecycleState>();
+                    if lifecycle.allow_exit.load(Ordering::SeqCst) {
+                        return;
+                    }
 
-                api.prevent_close();
-                let _ = window.emit(APP_CLOSE_INTENT_EVENT, ());
+                    api.prevent_close();
+                    let _ = window.emit(APP_CLOSE_INTENT_EVENT, ());
+                }
+                _ => {}
+            }
+        })
+        .on_webview_event(|webview, event| {
+            if webview.label() != "main" {
+                return;
+            }
+
+            let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, position }) = event else {
+                return;
+            };
+
+            let normalized_paths = paths
+                .iter()
+                .filter(|path| path.is_file())
+                .map(|path| normalize(path.clone()))
+                .collect::<Vec<_>>();
+            append_drag_debug_log(
+                &webview.app_handle(),
+                "webview-drag-drop",
+                &format!("position=({}, {}), paths={normalized_paths:?}", position.x, position.y),
+            );
+
+            let markdown_paths = normalized_paths
+                .iter()
+                .filter(|path| is_markdown(Path::new(path)))
+                .cloned()
+                .collect::<Vec<_>>();
+            let asset_paths = normalized_paths
+                .iter()
+                .filter(|path| !is_markdown(Path::new(path)))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if !markdown_paths.is_empty() {
+                append_drag_debug_log(
+                    &webview.app_handle(),
+                    "emit-open-dropped-markdown-files",
+                    &format!("paths={markdown_paths:?}"),
+                );
+                let _ = webview
+                    .window()
+                    .emit(OPEN_DROPPED_MARKDOWN_FILES_EVENT, markdown_paths);
+            }
+
+            if !asset_paths.is_empty() {
+                append_drag_debug_log(
+                    &webview.app_handle(),
+                    "emit-insert-dropped-asset-paths",
+                    &format!("paths={asset_paths:?}"),
+                );
+                let _ = webview.window().emit(
+                    INSERT_DROPPED_ASSET_PATHS_EVENT,
+                    DroppedAssetPathsPayload {
+                        paths: asset_paths,
+                        position: DropPositionPayload {
+                            x: position.x,
+                            y: position.y,
+                        },
+                    },
+                );
             }
         })
         .plugin(tauri_plugin_dialog::init())
@@ -1121,12 +1847,20 @@ fn main() {
             load_editor_session,
             save_editor_session,
             open_external_url,
+            open_local_path,
             open_file_location,
             read_image_data_url,
+            read_local_asset_metadata,
+            get_asset_directory_status,
             ensure_temporary_document_path,
             save_temporary_markdown_file,
             delete_temporary_document,
-            save_image_asset,
+            save_asset,
+            save_asset_from_path,
+            begin_asset_upload,
+            append_asset_upload_chunk,
+            finish_asset_upload,
+            queue_asset_import_from_path,
             request_app_exit,
             move_main_window_to_tray
         ])

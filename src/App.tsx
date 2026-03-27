@@ -12,9 +12,18 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { message as showDialogMessage, open, save } from "@tauri-apps/plugin-dialog";
+import {
+  open,
+  save,
+} from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { TabsBar } from "./components/TabsBar";
+import {
+  ASSET_IMPORT_STATUS_DOM_EVENT,
+  publishAttachmentImportState,
+  type AttachmentImportState,
+} from "./lib/attachmentImportState";
 import type { EditorTab } from "./types";
 
 const getFileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
@@ -63,11 +72,58 @@ const getDroppedMarkdownPaths = (paths: string[]) =>
     ),
   );
 
-const isMarkdownFile = (file: File) => /\.(md|markdown)$/i.test(file.name);
+const isMarkdownFileName = (name: string) => /\.(md|markdown)$/i.test(name.trim());
+
+const isMarkdownFile = (file: File) => isMarkdownFileName(file.name);
 
 type DroppedFileWithPath = File & {
   path?: string;
 };
+
+type AssetImportStatusPayload = {
+  documentPath: string;
+  relativePath: string;
+  fileName: string;
+  status: "completed" | "failed";
+  error?: string | null;
+};
+
+type AssetUploadSession = {
+  uploadId: string;
+  relativePath: string;
+  fileName: string;
+};
+
+type AssetDirectoryStatus = {
+  path: string;
+  exists: boolean;
+};
+
+type LocalAssetMetadata = {
+  fileName: string;
+  sizeBytes: number;
+  modifiedUnixMs?: number | null;
+  extension?: string | null;
+};
+
+type NativeDropSnapshot = {
+  paths: string[];
+  timestamp: number;
+};
+
+type DroppedAssetPathsPayload = {
+  paths: string[];
+  position: {
+    x: number;
+    y: number;
+  };
+};
+
+const getDroppedFilePath = (file: File) =>
+  normalizeDroppedPath((file as DroppedFileWithPath).path ?? "");
+
+const hasExternalFileTransfer = (dataTransfer: DataTransfer | null) =>
+  Array.from(dataTransfer?.types ?? []).includes("Files");
 
 const getDroppedPathsFromDataTransfer = (dataTransfer: DataTransfer | null) => {
   if (!dataTransfer) {
@@ -83,15 +139,18 @@ const getDroppedPathsFromDataTransfer = (dataTransfer: DataTransfer | null) => {
     return Array.from(new Set(directPaths));
   }
 
-  const uriList = dataTransfer.getData("text/uri-list");
-  if (!uriList) {
+  const transferPayloads = ["text/uri-list", "text/plain", "URL"]
+    .map((type) => dataTransfer.getData(type))
+    .filter(Boolean);
+
+  if (transferPayloads.length === 0) {
     return [];
   }
 
   return Array.from(
     new Set(
-      uriList
-        .split(/\r?\n/)
+      transferPayloads
+        .flatMap((payload) => payload.split(/\r?\n/))
         .map((value) => value.trim())
         .filter((value) => value && !value.startsWith("#"))
         .map(normalizeDroppedPath)
@@ -100,18 +159,93 @@ const getDroppedPathsFromDataTransfer = (dataTransfer: DataTransfer | null) => {
   );
 };
 
+const matchDroppedPathsToFiles = (files: File[], candidatePaths: string[]) => {
+  const normalizedCandidates = candidatePaths
+    .map(normalizeDroppedPath)
+    .filter((path): path is string => Boolean(path));
+  const usedCandidateIndexes = new Set<number>();
+
+  return files.map((file) => {
+    const directPath = getDroppedFilePath(file);
+    if (directPath) {
+      return directPath;
+    }
+
+    const fileName = file.name.trim().toLowerCase();
+    if (!fileName) {
+      return null;
+    }
+
+    const matchedIndex = normalizedCandidates.findIndex(
+      (candidatePath, index) =>
+        !usedCandidateIndexes.has(index) &&
+        getFileName(candidatePath).trim().toLowerCase() === fileName,
+    );
+
+    if (matchedIndex < 0) {
+      return null;
+    }
+
+    usedCandidateIndexes.add(matchedIndex);
+    return normalizedCandidates[matchedIndex];
+  });
+};
+
+type ExternalDragState = "idle" | "open" | "attach" | "moveToEditor" | "invalid";
+const TEMP_DOCS_PATH_SEGMENT = "/temp-docs/";
+
+const normalizeDocumentPathForStorageCheck = (path: string | null | undefined) =>
+  path?.trim().replace(/\\/g, "/").toLowerCase() ?? "";
+
+const isTemporaryDocumentPath = (path: string | null | undefined) =>
+  !path || normalizeDocumentPathForStorageCheck(path).includes(TEMP_DOCS_PATH_SEGMENT);
+
+const hasPersistedSourcePath = (path: string | null | undefined): path is string =>
+  Boolean(path && !isTemporaryDocumentPath(path));
+
+const getWorkingDocumentPath = (tab: EditorTab | null | undefined) => tab?.path ?? tab?.sourcePath ?? null;
+
 const canUseLocalFilePath = (
   tab: EditorTab | null | undefined,
-): tab is EditorTab & { path: string } => Boolean(tab?.path && !tab.temporary);
+): tab is EditorTab & { sourcePath: string } =>
+  hasPersistedSourcePath(tab?.sourcePath);
+
+const isRecoveredTab = (tab: EditorTab | null | undefined) =>
+  tab?.storageKind === "recovered";
+
+const isDroppedTemporaryTab = (tab: EditorTab | null | undefined) =>
+  tab?.storageKind === "temporaryFile";
+
+const isUntitledDraftTab = (tab: EditorTab | null | undefined) =>
+  tab?.storageKind === "draft";
+
+const usesTemporaryDocumentStorage = (tab: EditorTab | null | undefined) =>
+  !tab?.sourcePath || isTemporaryDocumentPath(tab?.path);
+
+const requiresSaveAsPath = (tab: EditorTab | null | undefined) => !canUseLocalFilePath(tab);
+
+const requiresSavedDocumentForLocalAssetImport = (
+  tab: EditorTab | null | undefined,
+  sourcePath: string | null | undefined,
+  origin: "drop" | "paste",
+) => (origin === "drop" || Boolean(sourcePath)) && !hasPersistedSourcePath(tab?.sourcePath);
 
 const TEMP_PREFIX = "temp:";
 const APP_NAME = "TinyMD";
+const MAX_IN_MEMORY_ASSET_BYTES = 32 * 1024 * 1024;
+const BACKGROUND_ASSET_IMPORT_BYTES = 16 * 1024 * 1024;
+const STREAMED_ASSET_UPLOAD_CHUNK_BYTES = 1024 * 1024;
+const NATIVE_DROP_PATH_TTL_MS = 2000;
 const APP_CLOSE_INTENT_EVENT = "app-close-intent";
 const TRAY_REQUEST_EXIT_EVENT = "tray-request-exit";
+const ASSET_IMPORT_STATUS_EVENT = "asset-import-status";
+const OPEN_DROPPED_MARKDOWN_FILES_EVENT = "open-dropped-markdown-files";
+const INSERT_DROPPED_ASSET_PATHS_EVENT = "insert-dropped-asset-paths";
 const RECOVERED_PREFIX = "recovered:";
 const LANGUAGE_STORAGE_KEY = "tinymd.language";
 const IMAGE_FOLDER_STORAGE_KEY = "tinymd.imageFolder";
-const DEFAULT_IMAGE_FOLDER = "assets";
+const DEFAULT_IMAGE_FOLDER = "_assets";
+const LEGACY_DEFAULT_IMAGE_FOLDER = "assets";
 
 type AppDragLogEntry = {
   label: string;
@@ -135,6 +269,15 @@ const describeDragTarget = (value: EventTarget | null) => {
       ? value.className
       : value.getAttribute("class") ?? "";
   return [value.tagName.toLowerCase(), className].filter(Boolean).join(".");
+};
+
+const isEditorDropTarget = (value: EventTarget | null) =>
+  value instanceof Element &&
+  Boolean(value.closest(".editor-source__textarea, .editor-shell, .milkdown"));
+
+const getElementFromPhysicalDropPosition = (position: { x: number; y: number }) => {
+  const scale = window.devicePixelRatio || 1;
+  return document.elementFromPoint(position.x / scale, position.y / scale);
 };
 
 const logAppDrag = (label: string, detail: Record<string, unknown>) => {
@@ -213,6 +356,20 @@ type TabContextMenuState = {
   y: number;
 };
 
+type AppDialogAction = {
+  id: string;
+  label: string;
+  tone?: "primary" | "ghost";
+};
+
+type AppDialogState = {
+  title: string;
+  message: string;
+  actions: AppDialogAction[];
+  defaultActionId?: string;
+  cancelActionId?: string;
+};
+
 type UiText = {
   menuOpen: string;
   menuNew: string;
@@ -254,8 +411,12 @@ type UiText = {
   outlineEmpty: string;
   outlinePrompt: string;
   dropToOpen: string;
+  dropToInsertAssets: string;
+  dropMoveToEditorOverlay: string;
   dropUnsupportedOverlay: string;
   dropUnsupportedMessage: string;
+  dropMoveToEditorMessage: string;
+  dropOpenPathRequired: string;
   noLocalDirectory: string;
   openedFolder: (title: string) => string;
   openFolderFailed: (error: string) => string;
@@ -279,6 +440,27 @@ type UiText = {
   imageRequiresSavedDocument: string;
   imageInsertFailed: (error: string) => string;
   imageInserted: (name: string) => string;
+  assetImportQueued: (name: string) => string;
+  assetImportCompleted: (name: string) => string;
+  assetImportFailed: (name: string, error: string) => string;
+  attachmentImporting: string;
+  attachmentImportFailed: string;
+  waitingForAttachmentImports: string;
+  clipboardAssetTooLarge: (name: string, size: string, limit: string) => string;
+  attachmentOpenTitle: string;
+  attachmentOpenConfirm: (name: string) => string;
+  attachmentOpenAction: string;
+  attachmentOpenCancel: string;
+  attachmentRequiresSaveTitle: string;
+  attachmentRequiresSaveConfirm: string;
+  attachmentRequiresSaveAction: string;
+  attachmentRequiresSaveCancel: string;
+  assetDirectoryCreateTitle: string;
+  assetDirectoryCreateConfirm: (path: string) => string;
+  assetDirectoryUseConfirm: (path: string) => string;
+  assetDirectoryRedirectConfirm: (path: string) => string;
+  assetDirectoryCreateAction: string;
+  assetDirectoryCreateCancel: string;
   confirmCloseDirtyTab: (title: string) => string;
   confirmCloseDirtyWindow: (count: number) => string;
   confirmCloseAction: string;
@@ -296,7 +478,7 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     menuOpen: "打开(O)",
     menuNew: "新建(N)",
     menuSave: "保存(S)",
-    menuImages: "图片(I)",
+    menuImages: "附件(I)",
     menuLanguage: "语言(L)",
     languageChinese: "简体中文",
     languageEnglish: "English",
@@ -333,8 +515,12 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     outlineEmpty: "当前文档没有可展示的标题。",
     outlinePrompt: "打开文档后显示目录。",
     dropToOpen: "松开以打开 Markdown 文档",
-    dropUnsupportedOverlay: "仅支持 .md / .markdown 文件",
+    dropToInsertAssets: "松开以插入图片或附件",
+    dropMoveToEditorOverlay: "将图片或附件拖到编辑器中插入",
+    dropUnsupportedOverlay: "当前拖拽内容不支持",
     dropUnsupportedMessage: "仅支持拖拽打开 Markdown 文档。",
+    dropMoveToEditorMessage: "请将图片或附件拖到编辑器中插入。",
+    dropOpenPathRequired: "无法从这次拖拽中获取 Markdown 文件的本地路径，请改用“打开文档”或从资源管理器直接拖入。",
     noLocalDirectory: "当前标签没有对应的本地文件目录。",
     openedFolder: (title) => `已打开 ${title} 所在目录。`,
     openFolderFailed: (error) => `打开目录失败：${error}`,
@@ -353,12 +539,37 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     restoreFailed: (error) => `恢复编辑状态失败：${error}`,
     saveSessionFailed: (error) => `保存编辑状态失败：${error}`,
     imageFolderPrompt: (folder) =>
-      `输入图片保存目录（相对当前文档目录）。\n当前值：${folder}\n留空会恢复为默认目录 ${DEFAULT_IMAGE_FOLDER}`,
-    imageFolderUpdated: (folder) => `图片保存目录已设置为 ${folder}`,
-    imageFolderInvalid: "图片目录无效，只支持相对路径，且不能包含 ..",
-    imageRequiresSavedDocument: "请先保存当前文档，再插入图片。",
-    imageInsertFailed: (error) => `插入图片失败：${error}`,
-    imageInserted: (name) => `已插入图片 ${name}`,
+      `输入附件保存目录（相对当前文档目录）。\n当前值：${folder}\n留空会恢复为默认目录 ${DEFAULT_IMAGE_FOLDER}`,
+    imageFolderUpdated: (folder) => `附件保存目录已设置为 ${folder}`,
+    imageFolderInvalid: "附件目录无效，只支持相对路径，且不能包含 ..",
+    imageRequiresSavedDocument: "请先保存当前文档，再插入附件。",
+    imageInsertFailed: (error) => `插入附件失败：${error}`,
+    imageInserted: (name) => `已插入附件 ${name}`,
+    assetImportQueued: (name) => `已插入附件 ${name}，正在后台导入。`,
+    assetImportCompleted: (name) => `附件 ${name} 已完成导入。`,
+    assetImportFailed: (name, error) => `附件 ${name} 导入失败：${error}`,
+    attachmentImporting: "正在导入...",
+    attachmentImportFailed: "导入失败",
+    waitingForAttachmentImports: "正在等待附件导入完成...",
+    clipboardAssetTooLarge: (name, size, limit) =>
+      `附件 ${name} 大小为 ${size}，超过剪贴板导入上限 ${limit}。请改用拖拽导入。`,
+    attachmentOpenTitle: "打开附件",
+    attachmentOpenConfirm: (name) => `确认打开附件“${name}”吗？`,
+    attachmentOpenAction: "打开",
+    attachmentOpenCancel: "取消",
+    attachmentRequiresSaveTitle: "先保存文档",
+    attachmentRequiresSaveConfirm: "临时文档暂不支持导入本地图片或附件，请先保存当前文档。",
+    attachmentRequiresSaveAction: "保存",
+    attachmentRequiresSaveCancel: "取消",
+    assetDirectoryCreateTitle: "创建附件目录",
+    assetDirectoryCreateConfirm: (path) =>
+      `首次插入附件会在当前文档目录下创建附件目录：${path}。是否继续？`,
+    assetDirectoryUseConfirm: (path) =>
+      `首次插入附件会使用当前文档目录下的附件目录：${path}。是否继续？`,
+    assetDirectoryRedirectConfirm: (path) =>
+      `当前文档已包含其他本地图片或附件引用。继续后，新插入的附件会保存到指定目录：${path}。是否继续？`,
+    assetDirectoryCreateAction: "继续",
+    assetDirectoryCreateCancel: "取消",
     confirmCloseDirtyTab: (title) => `“${title}”尚未保存。关闭前先保存吗？`,
     confirmCloseDirtyWindow: (count) =>
       `当前有 ${count} 个未保存文档。关闭应用前先保存吗？`,
@@ -375,7 +586,7 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     menuOpen: "Open(O)",
     menuNew: "New(N)",
     menuSave: "Save(S)",
-    menuImages: "Images(I)",
+    menuImages: "Attachments(I)",
     menuLanguage: "Language(L)",
     languageChinese: "简体中文",
     languageEnglish: "English",
@@ -412,8 +623,13 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     outlineEmpty: "No headings are available in the current document.",
     outlinePrompt: "Open a document to show its outline.",
     dropToOpen: "Drop to open the Markdown document",
-    dropUnsupportedOverlay: "Only .md / .markdown files are supported",
+    dropToInsertAssets: "Drop to insert images or attachments",
+    dropMoveToEditorOverlay: "Drop images or attachments into the editor to insert",
+    dropUnsupportedOverlay: "The current dragged content is not supported",
     dropUnsupportedMessage: "Only Markdown documents can be opened by drag and drop.",
+    dropMoveToEditorMessage: "Drop images or attachments into the editor to insert them.",
+    dropOpenPathRequired:
+      "The local path for the dragged Markdown file could not be resolved. Use Open Document or drag it directly from the file manager.",
     noLocalDirectory: "The current tab does not have a local file directory.",
     openedFolder: (title) => `Opened the folder for ${title}.`,
     openFolderFailed: (error) => `Failed to open folder: ${error}`,
@@ -432,12 +648,38 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     restoreFailed: (error) => `Failed to restore editor session: ${error}`,
     saveSessionFailed: (error) => `Failed to save editor session: ${error}`,
     imageFolderPrompt: (folder) =>
-      `Enter the image folder relative to the current document.\nCurrent value: ${folder}\nLeave it empty to reset to ${DEFAULT_IMAGE_FOLDER}`,
-    imageFolderUpdated: (folder) => `Image folder set to ${folder}`,
-    imageFolderInvalid: "Invalid image folder. Only relative paths without .. are allowed.",
-    imageRequiresSavedDocument: "Save the current document before inserting images.",
-    imageInsertFailed: (error) => `Failed to insert image: ${error}`,
-    imageInserted: (name) => `Inserted image ${name}`,
+      `Enter the attachment folder relative to the current document.\nCurrent value: ${folder}\nLeave it empty to reset to ${DEFAULT_IMAGE_FOLDER}`,
+    imageFolderUpdated: (folder) => `Attachment folder set to ${folder}`,
+    imageFolderInvalid: "Invalid attachment folder. Only relative paths without .. are allowed.",
+    imageRequiresSavedDocument: "Save the current document before inserting attachments.",
+    imageInsertFailed: (error) => `Failed to insert attachment: ${error}`,
+    imageInserted: (name) => `Inserted attachment ${name}`,
+    assetImportQueued: (name) => `Inserted attachment ${name}; importing in background.`,
+    assetImportCompleted: (name) => `Finished importing attachment ${name}.`,
+    assetImportFailed: (name, error) => `Failed to import attachment ${name}: ${error}`,
+    attachmentImporting: "Importing...",
+    attachmentImportFailed: "Import failed",
+    waitingForAttachmentImports: "Waiting for attachments to finish importing...",
+    clipboardAssetTooLarge: (name, size, limit) =>
+      `Attachment ${name} is ${size}, which exceeds the clipboard import limit of ${limit}. Use drag and drop instead.`,
+    attachmentOpenTitle: "Open Attachment",
+    attachmentOpenConfirm: (name) => `Open attachment "${name}"?`,
+    attachmentOpenAction: "Open",
+    attachmentOpenCancel: "Cancel",
+    attachmentRequiresSaveTitle: "Save Document First",
+    attachmentRequiresSaveConfirm:
+      "Local images and attachments require a saved document. Save the current document first.",
+    attachmentRequiresSaveAction: "Save",
+    attachmentRequiresSaveCancel: "Cancel",
+    assetDirectoryCreateTitle: "Create Attachment Folder",
+    assetDirectoryCreateConfirm: (path) =>
+      `The first attachment will create an attachment folder in the current document directory: ${path}. Continue?`,
+    assetDirectoryUseConfirm: (path) =>
+      `The first attachment will use the attachment folder in the current document directory: ${path}. Continue?`,
+    assetDirectoryRedirectConfirm: (path) =>
+      `This document already contains other local image or attachment links. Continue and save newly inserted attachments to ${path}?`,
+    assetDirectoryCreateAction: "Continue",
+    assetDirectoryCreateCancel: "Cancel",
     confirmCloseDirtyTab: (title) => `“${title}” has unsaved changes. Save before closing?`,
     confirmCloseDirtyWindow: (count) =>
       `${count} document(s) have unsaved changes. Save before closing the app?`,
@@ -500,7 +742,30 @@ const getInitialImageFolder = () => {
     return DEFAULT_IMAGE_FOLDER;
   }
 
-  return sanitizeImageFolderInput(stored) ?? DEFAULT_IMAGE_FOLDER;
+  const sanitized = sanitizeImageFolderInput(stored);
+  if (!sanitized || sanitized === LEGACY_DEFAULT_IMAGE_FOLDER) {
+    return DEFAULT_IMAGE_FOLDER;
+  }
+
+  return sanitized;
+};
+
+const formatAssetSize = (sizeBytes: number) => {
+  if (sizeBytes < 1024) {
+    return `${sizeBytes} B`;
+  }
+
+  const sizeKb = sizeBytes / 1024;
+  if (sizeKb < 1024) {
+    return `${sizeKb >= 100 ? Math.round(sizeKb) : sizeKb.toFixed(1)} KB`;
+  }
+
+  const sizeMb = sizeKb / 1024;
+  if (sizeMb < 1024) {
+    return `${sizeMb >= 100 ? Math.round(sizeMb) : sizeMb.toFixed(1)} MB`;
+  }
+
+  return `${(sizeMb / 1024).toFixed(1)} GB`;
 };
 
 const isImagePath = (path: string) => {
@@ -514,7 +779,7 @@ const isImageFile = (file: File) =>
   file.type.startsWith("image/") ||
   /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(file.name);
 
-const getClipboardImageFileName = (file: File) => {
+const getClipboardAssetFileName = (file: File) => {
   if (file.name.trim()) {
     return file.name;
   }
@@ -532,18 +797,95 @@ const getClipboardImageFileName = (file: File) => {
             ? "bmp"
             : mimeType === "image/avif"
               ? "avif"
-              : "png";
-  return `pasted-image.${extension}`;
+              : mimeType.split("/")[1]?.split("+")[0]?.replace(/[^a-z0-9-]/gi, "") || "bin";
+  return `${file.type.startsWith("image/") ? "pasted-image" : "attachment"}.${extension}`;
 };
 
-const getImageAltText = (fileName: string) => {
+const readBlobAsBase64 = (blob: Blob) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => {
+      reject(reader.error ?? new Error("无法读取附件分块"));
+    };
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const commaIndex = result.indexOf(",");
+      resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+    };
+    reader.readAsDataURL(blob);
+  });
+
+const getImageLabel = (fileName: string) => {
   const baseName = fileName.replace(/\.[^.]+$/, "").trim();
   const normalized = baseName.replace(/[_-]+/g, " ").replace(/[\[\]]/g, "").trim();
-  return normalized || "image";
+  return normalized || "attachment";
 };
 
-const createImageMarkdown = (markdownPath: string, fileName: string) =>
-  `![${getImageAltText(fileName)}](${markdownPath})`;
+const getAttachmentLabel = (fileName: string) => {
+  const normalized = fileName.trim().replace(/[\[\]]/g, "").trim();
+  return normalized || "attachment";
+};
+
+const escapeMarkdownLabel = (value: string) =>
+  value.replace(/\\/g, "\\\\").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
+
+const createAssetMarkdown = (
+  markdownPath: string,
+  fileName: string,
+  options?: { image?: boolean },
+) => {
+  const label = escapeMarkdownLabel(
+    options?.image ? getImageLabel(fileName) : getAttachmentLabel(fileName),
+  );
+  return options?.image
+    ? `![${label}](<${markdownPath}>)`
+    : `[${label}](<${markdownPath}>)`;
+};
+
+const normalizeMarkdownLinkTarget = (value: string) =>
+  value
+    .trim()
+    .replace(/^<|>$/g, "")
+    .replace(/\\/g, "/")
+    .replace(/^(\.\/)+/, "");
+
+const isLocalMarkdownLinkTarget = (value: string) =>
+  Boolean(value) && !/^(?:[a-z][a-z0-9+.-]*:|\/\/|#|\/)/i.test(value);
+
+const getDocumentAssetDirectoryUsage = (
+  markdown: string,
+  assetsDir: string,
+): "configured" | "other" | "none" => {
+  const normalizedAssetsDir = sanitizeImageFolderInput(assetsDir) ?? DEFAULT_IMAGE_FOLDER;
+  const pattern = /(!?)\[[^\]]*]\(\s*(?:<([^>]+)>|([^\s)]+))/g;
+  let hasOtherLocalAssetReference = false;
+
+  for (const match of markdown.matchAll(pattern)) {
+    const isImage = match[1] === "!";
+    const target = normalizeMarkdownLinkTarget(match[2] ?? match[3] ?? "");
+
+    if (!isLocalMarkdownLinkTarget(target)) {
+      continue;
+    }
+
+    if (!isImage && /\.(md|markdown)(?:$|[?#])/i.test(target)) {
+      continue;
+    }
+
+    if (target === normalizedAssetsDir || target.startsWith(`${normalizedAssetsDir}/`)) {
+      return "configured";
+    }
+
+    hasOtherLocalAssetReference = true;
+  }
+
+  return hasOtherLocalAssetReference ? "other" : "none";
+};
+
+const getAttachableFiles = (files: Iterable<File>) =>
+  Array.from(files).filter((file) => !isMarkdownFile(file));
+
+const joinAssetBlocks = (snippets: string[]) => snippets.join("\n\n");
 
 const normalizeHeadingTitle = (value: string) =>
   value
@@ -656,7 +998,7 @@ const getRichHeadingElements = (root: HTMLDivElement | null) =>
 export default function App() {
   const initialLanguageRef = useRef<UiLanguage>(getInitialLanguage());
   const initialImageFolderRef = useRef(getInitialImageFolder());
-  const dragKindRef = useRef<"idle" | "valid" | "invalid">("invalid");
+  const dragKindRef = useRef<ExternalDragState>("idle");
   const dragDepthRef = useRef(0);
   const internalDragRef = useRef(false);
   const tabsRef = useRef<EditorTab[]>([]);
@@ -664,6 +1006,15 @@ export default function App() {
   const allowWindowCloseRef = useRef(false);
   const loadingTabIdsRef = useRef(new Set<string>());
   const sessionReadyRef = useRef(false);
+  const latestNativeDropRef = useRef<NativeDropSnapshot | null>(null);
+  const lastHandledNativeDropRef = useRef<{
+    signature: string;
+    timestamp: number;
+  } | null>(null);
+  const pendingAssetImportsRef = useRef(new Map<string, Set<string>>());
+  const pendingAssetImportWaitersRef = useRef(new Map<string, Set<() => void>>());
+  const appDialogResolverRef = useRef<((result: string | null) => void) | null>(null);
+  const confirmDialogPrimaryButtonRef = useRef<HTMLButtonElement | null>(null);
   const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const languageMenuRef = useRef<HTMLDivElement | null>(null);
   const [language, setLanguage] = useState<UiLanguage>(initialLanguageRef.current);
@@ -671,13 +1022,14 @@ export default function App() {
   const [tabs, setTabs] = useState<EditorTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [dragState, setDragState] = useState<"idle" | "valid" | "invalid">("idle");
+  const [dragState, setDragState] = useState<ExternalDragState>("idle");
   const [editorMode, setEditorMode] = useState<EditorMode>("rich");
   const [showOutline, setShowOutline] = useState(true);
   const [activeOutlineId, setActiveOutlineId] = useState<string | null>(null);
   const [richEditorRoot, setRichEditorRoot] = useState<HTMLDivElement | null>(null);
   const [tabContextMenu, setTabContextMenu] = useState<TabContextMenuState | null>(null);
   const [languageMenuOpen, setLanguageMenuOpen] = useState(false);
+  const [appDialog, setAppDialog] = useState<AppDialogState | null>(null);
   const [message, setMessage] = useState(
     UI_TEXT[initialLanguageRef.current].readyMessage,
   );
@@ -697,24 +1049,123 @@ export default function App() {
     [activeTab?.loaded, activeTab?.content],
   );
 
+  const closeAppDialog = useEffectEvent((result: string | null) => {
+    const resolver = appDialogResolverRef.current;
+    appDialogResolverRef.current = null;
+    setAppDialog(null);
+    resolver?.(result);
+  });
+
+  const showAppDialog = useEffectEvent(
+    (dialog: AppDialogState) =>
+      new Promise<string | null>((resolve) => {
+        const pending = appDialogResolverRef.current;
+        if (pending) {
+          pending(null);
+        }
+
+        appDialogResolverRef.current = resolve;
+        setAppDialog(dialog);
+      }),
+  );
+
+  const showConfirmDialog = useEffectEvent(
+    async (dialog: {
+      title: string;
+      message: string;
+      okLabel: string;
+      cancelLabel: string;
+    }) => {
+      const result = await showAppDialog({
+        title: dialog.title,
+        message: dialog.message,
+        actions: [
+          { id: "cancel", label: dialog.cancelLabel, tone: "ghost" },
+          { id: "ok", label: dialog.okLabel, tone: "primary" },
+        ],
+        defaultActionId: "ok",
+        cancelActionId: "cancel",
+      });
+
+      return result === "ok";
+    },
+  );
+
+  const resolveDroppedSourcePaths = useEffectEvent(
+    (files: File[], dataTransfer: DataTransfer | null) => {
+      const transferPaths = getDroppedPathsFromDataTransfer(dataTransfer);
+      const recentNativeDrop =
+        hasExternalFileTransfer(dataTransfer) &&
+        latestNativeDropRef.current &&
+        Date.now() - latestNativeDropRef.current.timestamp <= NATIVE_DROP_PATH_TTL_MS
+          ? latestNativeDropRef.current.paths
+          : [];
+
+      return matchDroppedPathsToFiles(
+        files,
+        transferPaths.length > 0 ? transferPaths : recentNativeDrop,
+      );
+    },
+  );
+
+  const getRecentNativeDropPaths = useEffectEvent(() => {
+    if (
+      latestNativeDropRef.current &&
+      Date.now() - latestNativeDropRef.current.timestamp <= NATIVE_DROP_PATH_TTL_MS
+    ) {
+      return latestNativeDropRef.current.paths;
+    }
+
+    return [];
+  });
+
+  const resolveDroppedPaths = useEffectEvent((dataTransfer: DataTransfer | null) => {
+    const transferPaths = getDroppedPathsFromDataTransfer(dataTransfer);
+    if (transferPaths.length > 0) {
+      return transferPaths;
+    }
+
+    return hasExternalFileTransfer(dataTransfer) ? getRecentNativeDropPaths() : [];
+  });
+
+  const waitForPendingAssetImports = useEffectEvent(async (documentPath: string | null | undefined) => {
+    if (!documentPath) {
+      return;
+    }
+
+    const pending = pendingAssetImportsRef.current.get(documentPath);
+    if (!pending || pending.size === 0) {
+      return;
+    }
+
+    setMessage(t.waitingForAttachmentImports);
+    await new Promise<void>((resolve) => {
+      const waiters = pendingAssetImportWaitersRef.current.get(documentPath) ?? new Set();
+      waiters.add(resolve);
+      pendingAssetImportWaitersRef.current.set(documentPath, waiters);
+    });
+  });
+
   const promptUnsavedDecision = async (
     messageText: string,
   ): Promise<"save" | "discard" | "cancel"> => {
-    const result = await showDialogMessage(messageText, {
+    const result = await showAppDialog({
       title: APP_NAME,
-      kind: "warning",
-      buttons: {
-        yes: t.unsavedSave,
-        no: t.unsavedDiscard,
-        cancel: t.unsavedCancel,
-      },
+      message: messageText,
+      actions: [
+        { id: "cancel", label: t.unsavedCancel, tone: "ghost" },
+        { id: "discard", label: t.unsavedDiscard, tone: "ghost" },
+        { id: "save", label: t.unsavedSave, tone: "primary" },
+      ],
+      defaultActionId: "save",
+      cancelActionId: "cancel",
     });
 
-    if (result === t.unsavedSave) {
+    if (result === "save") {
       return "save";
     }
 
-    if (result === t.unsavedDiscard) {
+    if (result === "discard") {
       return "discard";
     }
 
@@ -722,21 +1173,23 @@ export default function App() {
   };
 
   const promptCloseAction = async (): Promise<"exit" | "tray" | "cancel"> => {
-    const result = await showDialogMessage(t.confirmCloseAction, {
+    const result = await showAppDialog({
       title: APP_NAME,
-      kind: "warning",
-      buttons: {
-        yes: t.closeActionExit,
-        no: t.closeActionTray,
-        cancel: t.closeActionCancel,
-      },
+      message: t.confirmCloseAction,
+      actions: [
+        { id: "cancel", label: t.closeActionCancel, tone: "ghost" },
+        { id: "tray", label: t.closeActionTray, tone: "ghost" },
+        { id: "exit", label: t.closeActionExit, tone: "primary" },
+      ],
+      defaultActionId: "exit",
+      cancelActionId: "cancel",
     });
 
-    if (result === t.closeActionExit) {
+    if (result === "exit") {
       return "exit";
     }
 
-    if (result === t.closeActionTray) {
+    if (result === "tray") {
       return "tray";
     }
 
@@ -776,7 +1229,9 @@ export default function App() {
   const openPaths = async (paths: string[], availableTabs = tabsRef.current) => {
     const uniquePaths = Array.from(new Set(paths));
     const existingTabs = new Map(
-      availableTabs.filter((tab) => tab.path).map((tab) => [tab.path as string, tab]),
+      availableTabs
+        .filter((tab) => tab.sourcePath)
+        .map((tab) => [tab.sourcePath as string, tab]),
     );
     const pendingPaths = uniquePaths.filter((path) => !existingTabs.has(path));
 
@@ -798,11 +1253,12 @@ export default function App() {
           const nextTab: EditorTab = {
             id: path,
             path,
+            sourcePath: path,
             title: getFileName(path),
             content,
             savedContent: content,
             dirty: false,
-            temporary: false,
+            storageKind: "saved",
             loaded: true,
           };
           return nextTab;
@@ -811,73 +1267,13 @@ export default function App() {
 
       setTabs((current) => {
         const existingPaths = new Set(
-          current.filter((tab) => tab.path).map((tab) => tab.path as string),
+          current.filter((tab) => tab.sourcePath).map((tab) => tab.sourcePath as string),
         );
         const tabsToAppend = loadedTabs.filter(
-          (tab) => !existingPaths.has(tab.path as string),
+          (tab) => !existingPaths.has(tab.sourcePath as string),
         );
         return tabsToAppend.length > 0 ? [...current, ...tabsToAppend] : current;
       });
-      setActiveTabId(loadedTabs[loadedTabs.length - 1]?.id ?? activeTabIdRef.current);
-      setMessage(
-        loadedTabs.length === 1
-          ? t.openedFile(loadedTabs[0].title)
-          : t.openedFiles(loadedTabs.length),
-      );
-    } catch (error) {
-      setMessage(t.openFailed(String(error)));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const openDroppedMarkdownFiles = async (files: File[]) => {
-    const markdownFiles = files.filter(isMarkdownFile);
-    if (markdownFiles.length === 0) {
-      return;
-    }
-
-    const pathBackedFiles = markdownFiles
-      .map((file) => ({
-        file,
-        path: normalizeDroppedPath((file as DroppedFileWithPath).path ?? ""),
-      }))
-      .filter((entry): entry is { file: File; path: string } => Boolean(entry.path));
-
-    const pathBackedPaths = pathBackedFiles.map((entry) => entry.path);
-    const pathBackedNames = new Set(pathBackedFiles.map((entry) => entry.file.name));
-    const temporaryFiles = markdownFiles.filter((file) => !pathBackedNames.has(file.name));
-
-    if (pathBackedPaths.length > 0) {
-      await openPaths(pathBackedPaths);
-    }
-
-    if (temporaryFiles.length === 0) {
-      return;
-    }
-
-    setBusy(true);
-    try {
-      const loadedTabs = await Promise.all(
-        temporaryFiles.map(async (file, index) => {
-          const content = await file.text();
-          const title = file.name;
-          const id = `${TEMP_PREFIX}drop:${Date.now()}:${index}:${title}`;
-          const nextTab: EditorTab = {
-            id,
-            path: null,
-            title,
-            content,
-            savedContent: content,
-            dirty: false,
-            temporary: true,
-            loaded: true,
-          };
-          return nextTab;
-        }),
-      );
-
-      setTabs((current) => [...current, ...loadedTabs]);
       setActiveTabId(loadedTabs[loadedTabs.length - 1]?.id ?? activeTabIdRef.current);
       setMessage(
         loadedTabs.length === 1
@@ -923,8 +1319,8 @@ export default function App() {
 
     setBusy(true);
     try {
-      let targetPath = tab.path;
-      if (tab.temporary || !targetPath) {
+      let targetPath = canUseLocalFilePath(tab) ? tab.sourcePath : null;
+      if (requiresSaveAsPath(tab) || !targetPath) {
         const suggested = tab.title.endsWith(".md") ? tab.title : `${tab.title}.md`;
         const result = await save({
           title: t.saveDialogTitle,
@@ -941,14 +1337,18 @@ export default function App() {
       }
 
       const conflict = tabs.find(
-        (item) => item.id !== tab.id && item.path === targetPath,
+        (item) => item.id !== tab.id && item.sourcePath === targetPath,
       );
       if (conflict) {
         setMessage(t.saveConflict(getFileName(targetPath)));
         return false;
       }
 
-      const nextContent = tab.temporary
+      if (usesTemporaryDocumentStorage(tab)) {
+        await waitForPendingAssetImports(getWorkingDocumentPath(tab));
+      }
+
+      const nextContent = usesTemporaryDocumentStorage(tab)
         ? await invoke<string>("save_temporary_markdown_file", {
             tabId: tab.id,
             path: targetPath,
@@ -956,7 +1356,7 @@ export default function App() {
           })
         : tab.content;
 
-      if (!tab.temporary) {
+      if (!usesTemporaryDocumentStorage(tab)) {
         await invoke("save_markdown_file", {
           path: targetPath,
           content: tab.content,
@@ -970,11 +1370,12 @@ export default function App() {
                 ...item,
                 id: targetPath!,
                 path: targetPath!,
+                sourcePath: targetPath!,
                 title: getFileName(targetPath!),
                 content: nextContent,
                 savedContent: nextContent,
                 dirty: false,
-                temporary: false,
+                storageKind: "saved",
                 loaded: true,
               }
             : item,
@@ -1002,7 +1403,7 @@ export default function App() {
   };
 
   const cleanupTemporaryTab = async (tab: EditorTab) => {
-    if (!tab.temporary) {
+    if (!usesTemporaryDocumentStorage(tab)) {
       return;
     }
 
@@ -1053,17 +1454,18 @@ export default function App() {
   };
 
   const handleCreateDocument = () => {
-    const index = tabs.filter((tab) => tab.temporary).length + 1;
+    const index = tabs.filter((tab) => isUntitledDraftTab(tab)).length + 1;
     const title = `${t.untitledPrefix}${index}.md`;
     const id = `${TEMP_PREFIX}${Date.now()}`;
     const nextTab: EditorTab = {
       id,
       path: null,
+      sourcePath: null,
       title,
       content: "",
       savedContent: "",
       dirty: false,
-      temporary: true,
+      storageKind: "draft",
       loaded: true,
     };
 
@@ -1220,6 +1622,72 @@ export default function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+
+    void listen<AssetImportStatusPayload>(ASSET_IMPORT_STATUS_EVENT, (event) => {
+      const payload = event.payload;
+      publishAttachmentImportState(payload);
+
+      if (payload.status === "completed") {
+        setMessage(t.assetImportCompleted(payload.fileName));
+        return;
+      }
+
+      setMessage(t.assetImportFailed(payload.fileName, payload.error ?? "unknown error"));
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [t]);
+
+  useEffect(() => {
+    const handleAssetImportState = (event: Event) => {
+      const payload = (event as CustomEvent<AttachmentImportState>).detail;
+      const current = pendingAssetImportsRef.current.get(payload.documentPath) ?? new Set<string>();
+
+      if (payload.status === "queued") {
+        current.add(payload.relativePath);
+        pendingAssetImportsRef.current.set(payload.documentPath, current);
+        return;
+      }
+
+      if (current.size === 0) {
+        return;
+      }
+
+      current.delete(payload.relativePath);
+      if (current.size > 0) {
+        pendingAssetImportsRef.current.set(payload.documentPath, current);
+        return;
+      }
+
+      pendingAssetImportsRef.current.delete(payload.documentPath);
+      const waiters = pendingAssetImportWaitersRef.current.get(payload.documentPath);
+      if (!waiters) {
+        return;
+      }
+
+      pendingAssetImportWaitersRef.current.delete(payload.documentPath);
+      waiters.forEach((resolve) => resolve());
+    };
+
+    window.addEventListener(
+      ASSET_IMPORT_STATUS_DOM_EVENT,
+      handleAssetImportState as EventListener,
+    );
+
+    return () => {
+      window.removeEventListener(
+        ASSET_IMPORT_STATUS_DOM_EVENT,
+        handleAssetImportState as EventListener,
+      );
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
     let handlingClose = false;
 
     void listen(APP_CLOSE_INTENT_EVENT, async () => {
@@ -1370,7 +1838,7 @@ export default function App() {
   }, [showOutline, editorMode, activeTab?.id, activeTab?.content, syncActiveOutline]);
 
   useEffect(() => {
-    if (!activeTab || activeTab.loaded || activeTab.temporary || !activeTab.path) {
+    if (!activeTab || activeTab.loaded || !canUseLocalFilePath(activeTab)) {
       return;
     }
 
@@ -1381,7 +1849,7 @@ export default function App() {
     loadingTabIdsRef.current.add(activeTab.id);
     const targetTab = activeTab;
 
-    void invoke<string>("read_markdown_file", { path: targetTab.path })
+    void invoke<string>("read_markdown_file", { path: targetTab.sourcePath })
       .then((content) => {
         setTabs((current) =>
           current.map((tab) =>
@@ -1426,11 +1894,12 @@ export default function App() {
                     ...tab,
                     id: recoveredId,
                     path: null,
+                    sourcePath: null,
                     title: getRecoveredTabTitle(tab.title, t.recoveredSuffix),
                     content: snapshot,
                     savedContent: snapshot,
                     dirty: true,
-                    temporary: true,
+                    storageKind: "recovered",
                     loaded: true,
                   }
                 : tab,
@@ -1579,33 +2048,98 @@ export default function App() {
     };
   }, [tabContextMenu]);
 
-  const handleDroppedPaths = useEffectEvent((paths: string[]) => {
-    const markdownPaths = getDroppedMarkdownPaths(paths);
-    if (markdownPaths.length === 0) {
+  useEffect(() => {
+    if (!appDialog) {
       return;
     }
 
-    void openPaths(markdownPaths);
-  });
+    const frame = window.requestAnimationFrame(() => {
+      confirmDialogPrimaryButtonRef.current?.focus();
+    });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeAppDialog(appDialog.cancelActionId ?? null);
+        return;
+      }
 
-  const handleDroppedFiles = useEffectEvent((files: File[]) => {
-    const markdownFiles = files.filter(isMarkdownFile);
-    if (markdownFiles.length === 0) {
-      return;
-    }
+      if (
+        event.key === "Enter" &&
+        !event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.shiftKey
+      ) {
+        event.preventDefault();
+        closeAppDialog(appDialog.defaultActionId ?? appDialog.actions[0]?.id ?? null);
+      }
+    };
 
-    void openDroppedMarkdownFiles(markdownFiles);
-  });
+    window.addEventListener("keydown", onKeyDown, true);
 
-  const saveImageAssetFromFile = async (file: File) => {
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [appDialog, closeAppDialog]);
+
+  useEffect(() => () => {
+    const resolver = appDialogResolverRef.current;
+    appDialogResolverRef.current = null;
+    resolver?.(null);
+  }, []);
+
+  const saveAssetFromLocalPath = async (
+    sourcePath: string,
+    origin: "drop" = "drop",
+  ) => {
     if (!activeTab || !activeTab.loaded) {
       setMessage(t.loading);
       return null;
     }
 
     try {
-      let documentPath = activeTab.path;
-      if (activeTab.temporary) {
+      const normalizedSourcePath = normalizeDroppedPath(sourcePath) ?? sourcePath;
+      const metadata = await invoke<LocalAssetMetadata>("read_local_asset_metadata", {
+        path: normalizedSourcePath,
+      });
+      const fileName = metadata.fileName || getFileName(normalizedSourcePath);
+      const isImage = isImagePath(normalizedSourcePath);
+      const activeDocumentPath = activeTab.sourcePath ?? activeTab.path;
+      const requiresSavedDocumentForLocalAsset = requiresSavedDocumentForLocalAssetImport(
+        activeTab,
+        normalizedSourcePath,
+        origin,
+      );
+
+      logAppDrag("asset-import-context", {
+        activeTabId: activeTab.id,
+        activeTabTitle: activeTab.title,
+        activeTabPath: activeTab.path,
+        activeTabSourcePath: activeTab.sourcePath,
+        activeTabStorageKind: activeTab.storageKind,
+        origin,
+        sourcePath: normalizedSourcePath,
+        requiresSavedDocumentForLocalAsset,
+      });
+
+      if (requiresSavedDocumentForLocalAsset) {
+        const shouldSaveFirst = await showConfirmDialog({
+          title: t.attachmentRequiresSaveTitle,
+          message: t.attachmentRequiresSaveConfirm,
+          okLabel: t.attachmentRequiresSaveAction,
+          cancelLabel: t.attachmentRequiresSaveCancel,
+        });
+        if (shouldSaveFirst) {
+          await handleSaveTab();
+        } else {
+          setMessage(t.imageRequiresSavedDocument);
+        }
+        return null;
+      }
+
+      let documentPath = activeDocumentPath;
+      if (usesTemporaryDocumentStorage(activeTab)) {
         documentPath =
           activeTab.path ??
           (await invoke<string>("ensure_temporary_document_path", {
@@ -1628,18 +2162,351 @@ export default function App() {
         return null;
       }
 
-      const fileName = getClipboardImageFileName(file);
-      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-      const markdownPath = await invoke<string>("save_image_asset", {
-        documentPath,
-        assetsDir: imageFolder,
+      if (canUseLocalFilePath(activeTab)) {
+        const shouldCreateAssetDir = await confirmAssetDirectoryCreation(
+          activeTab.sourcePath,
+          activeTab.content,
+        );
+        if (!shouldCreateAssetDir) {
+          return null;
+        }
+      }
+
+      const queueImportFromPath =
+        canUseLocalFilePath(activeTab) &&
+        !isImage &&
+        metadata.sizeBytes >= BACKGROUND_ASSET_IMPORT_BYTES;
+
+      logAppDrag("asset-import-decision", {
         fileName,
-        bytes,
+        fileSize: metadata.sizeBytes,
+        sourcePath: normalizedSourcePath,
+        documentPath,
+        activeDocumentPath,
+        storageKind: activeTab.storageKind,
+        queueImportFromPath,
+        queueStreamedUpload: false,
       });
-      setMessage(t.imageInserted(getFileName(markdownPath)));
+
+      const markdownPath = queueImportFromPath
+        ? await invoke<string>("queue_asset_import_from_path", {
+            documentPath,
+            assetsDir: imageFolder,
+            sourcePath: normalizedSourcePath,
+            fileName,
+          })
+        : await invoke<string>("save_asset_from_path", {
+            documentPath,
+            assetsDir: imageFolder,
+            sourcePath: normalizedSourcePath,
+            fileName,
+          });
+
+      setMessage(
+        queueImportFromPath
+          ? t.assetImportQueued(getFileName(fileName))
+          : t.imageInserted(getFileName(markdownPath)),
+      );
+
+      if (queueImportFromPath) {
+        publishAttachmentImportState({
+          documentPath,
+          relativePath: markdownPath,
+          fileName,
+          status: "queued",
+          error: null,
+        });
+      }
+
       return {
         markdownPath,
         fileName,
+        isImage,
+      };
+    } catch (error) {
+      setMessage(t.imageInsertFailed(String(error)));
+      return null;
+    }
+  };
+
+  const openLocalPathWithConfirmation = useEffectEvent(
+    async (path: string, label?: string) => {
+      const displayName = label?.trim() || getFileName(path);
+      const confirmed = await showConfirmDialog({
+        title: t.attachmentOpenTitle,
+        message: t.attachmentOpenConfirm(displayName),
+        okLabel: t.attachmentOpenAction,
+        cancelLabel: t.attachmentOpenCancel,
+      });
+
+      if (!confirmed) {
+        return;
+      }
+
+      await invoke("open_local_path", { path });
+    },
+  );
+
+  const revealLocalPath = useEffectEvent(async (path: string, label?: string) => {
+    const displayName = label?.trim() || getFileName(path);
+
+    try {
+      await invoke("open_file_location", { path });
+      setMessage(t.openedFolder(displayName));
+    } catch (error) {
+      setMessage(t.openFolderFailed(String(error)));
+    }
+  });
+
+  const streamAssetUpload = useEffectEvent(
+    async (
+      file: File,
+      session: AssetUploadSession,
+      documentPath: string,
+    ) => {
+      let uploadError: string | null = null;
+
+      try {
+        for (let offset = 0; offset < file.size; offset += STREAMED_ASSET_UPLOAD_CHUNK_BYTES) {
+          const chunk = file.slice(offset, offset + STREAMED_ASSET_UPLOAD_CHUNK_BYTES);
+          const base64Chunk = await readBlobAsBase64(chunk);
+          await invoke("append_asset_upload_chunk", {
+            uploadId: session.uploadId,
+            base64Chunk,
+          });
+        }
+      } catch (error) {
+        uploadError = String(error);
+      }
+
+      logAppDrag("asset-stream-upload-finish", {
+        fileName: session.fileName,
+        documentPath,
+        relativePath: session.relativePath,
+        uploadId: session.uploadId,
+        uploadError,
+      });
+
+      try {
+        await invoke("finish_asset_upload", {
+          uploadId: session.uploadId,
+          error: uploadError,
+        });
+      } catch (error) {
+        const fallbackError = uploadError ?? String(error);
+        publishAttachmentImportState({
+          documentPath,
+          relativePath: session.relativePath,
+          fileName: session.fileName,
+          status: "failed",
+          error: fallbackError,
+        });
+        setMessage(t.assetImportFailed(session.fileName, fallbackError));
+        return fallbackError;
+      }
+
+      return uploadError;
+    },
+  );
+
+  const confirmAssetDirectoryCreation = useEffectEvent(async (
+    documentPath: string,
+    markdown: string,
+  ) => {
+    const status = await invoke<AssetDirectoryStatus>("get_asset_directory_status", {
+      documentPath,
+      assetsDir: imageFolder,
+    });
+
+    const usage = getDocumentAssetDirectoryUsage(markdown, imageFolder);
+    if (usage === "configured") {
+      return true;
+    }
+
+    const message = usage === "other"
+      ? t.assetDirectoryRedirectConfirm(status.path)
+      : status.exists
+        ? t.assetDirectoryUseConfirm(status.path)
+        : t.assetDirectoryCreateConfirm(status.path);
+
+    return showConfirmDialog({
+      title: t.assetDirectoryCreateTitle,
+      message,
+      okLabel: t.assetDirectoryCreateAction,
+      cancelLabel: t.assetDirectoryCreateCancel,
+    });
+  });
+
+  const saveAssetFromFile = async (
+    file: File,
+    sourcePathOverride?: string | null,
+    origin: "drop" | "paste" = "paste",
+  ) => {
+    if (!activeTab || !activeTab.loaded) {
+      setMessage(t.loading);
+      return null;
+    }
+
+    try {
+      const fileName = getClipboardAssetFileName(file);
+      const sourcePath = sourcePathOverride ?? getDroppedFilePath(file);
+      const activeDocumentPath = activeTab.sourcePath ?? activeTab.path;
+      const requiresSavedDocumentForLocalAsset = requiresSavedDocumentForLocalAssetImport(
+        activeTab,
+        sourcePath,
+        origin,
+      );
+
+      logAppDrag("asset-import-context", {
+        activeTabId: activeTab.id,
+        activeTabTitle: activeTab.title,
+        activeTabPath: activeTab.path,
+        activeTabSourcePath: activeTab.sourcePath,
+        activeTabStorageKind: activeTab.storageKind,
+        origin,
+        sourcePath,
+        requiresSavedDocumentForLocalAsset,
+      });
+
+      if (requiresSavedDocumentForLocalAsset) {
+        const shouldSaveFirst = await showConfirmDialog({
+          title: t.attachmentRequiresSaveTitle,
+          message: t.attachmentRequiresSaveConfirm,
+          okLabel: t.attachmentRequiresSaveAction,
+          cancelLabel: t.attachmentRequiresSaveCancel,
+        });
+        if (shouldSaveFirst) {
+          await handleSaveTab();
+        } else {
+          setMessage(t.imageRequiresSavedDocument);
+        }
+        return null;
+      }
+
+      let documentPath = activeDocumentPath;
+      if (usesTemporaryDocumentStorage(activeTab)) {
+        documentPath =
+          activeTab.path ??
+          (await invoke<string>("ensure_temporary_document_path", {
+            tabId: activeTab.id,
+          }));
+        setTabs((current) =>
+          current.map((tab) =>
+            tab.id === activeTab.id
+              ? {
+                  ...tab,
+                  path: documentPath,
+                }
+              : tab,
+          ),
+        );
+      }
+
+      if (!documentPath) {
+        setMessage(t.imageRequiresSavedDocument);
+        return null;
+      }
+
+      if (canUseLocalFilePath(activeTab)) {
+        const shouldCreateAssetDir = await confirmAssetDirectoryCreation(
+          activeTab.sourcePath,
+          activeTab.content,
+        );
+        if (!shouldCreateAssetDir) {
+          return null;
+        }
+      }
+
+      const requiresChunkedUpload =
+        !sourcePath && !isImageFile(file) && file.size > MAX_IN_MEMORY_ASSET_BYTES;
+      const queueImportFromPath =
+        Boolean(sourcePath) &&
+        canUseLocalFilePath(activeTab) &&
+        !isImageFile(file) &&
+        file.size >= BACKGROUND_ASSET_IMPORT_BYTES;
+      const queueStreamedUpload =
+        requiresChunkedUpload && !isImageFile(file);
+
+      logAppDrag("asset-import-decision", {
+        fileName,
+        fileSize: file.size,
+        sourcePath,
+        documentPath,
+        activeDocumentPath,
+        storageKind: activeTab.storageKind,
+        queueImportFromPath,
+        queueStreamedUpload,
+      });
+
+      if (!sourcePath && !requiresChunkedUpload && file.size > MAX_IN_MEMORY_ASSET_BYTES) {
+        throw new Error(
+          t.clipboardAssetTooLarge(
+            fileName,
+            formatAssetSize(file.size),
+            formatAssetSize(MAX_IN_MEMORY_ASSET_BYTES),
+          ),
+        );
+      }
+
+      const queuedUploadSession = requiresChunkedUpload
+        ? await invoke<AssetUploadSession>("begin_asset_upload", {
+            documentPath,
+            assetsDir: imageFolder,
+            fileName,
+          })
+        : null;
+      if (queuedUploadSession) {
+        logAppDrag("asset-stream-upload-start", {
+          fileName: queuedUploadSession.fileName,
+          documentPath,
+          relativePath: queuedUploadSession.relativePath,
+          uploadId: queuedUploadSession.uploadId,
+          mode: usesTemporaryDocumentStorage(activeTab) ? "temporary-background" : "background",
+        });
+      }
+      const markdownPath = queuedUploadSession
+        ? queuedUploadSession.relativePath
+        : queueImportFromPath
+          ? await invoke<string>("queue_asset_import_from_path", {
+            documentPath,
+            assetsDir: imageFolder,
+            sourcePath,
+            fileName,
+          })
+        : sourcePath
+          ? await invoke<string>("save_asset_from_path", {
+            documentPath,
+            assetsDir: imageFolder,
+            sourcePath,
+            fileName,
+          })
+          : await invoke<string>("save_asset", {
+            documentPath,
+            assetsDir: imageFolder,
+            fileName,
+            bytes: Array.from(new Uint8Array(await file.arrayBuffer())),
+          });
+      if (queuedUploadSession) {
+        void streamAssetUpload(file, queuedUploadSession, documentPath);
+      }
+      setMessage(
+        queueImportFromPath || queuedUploadSession
+          ? t.assetImportQueued(getFileName(fileName))
+          : t.imageInserted(getFileName(markdownPath)),
+      );
+      if (queueImportFromPath || queuedUploadSession) {
+        publishAttachmentImportState({
+          documentPath,
+          relativePath: markdownPath,
+          fileName,
+          status: "queued",
+          error: null,
+        });
+      }
+      return {
+        markdownPath,
+        fileName,
+        isImage: isImageFile(file),
       };
     } catch (error) {
       setMessage(t.imageInsertFailed(String(error)));
@@ -1663,13 +2530,31 @@ export default function App() {
     setMessage(t.imageFolderUpdated(nextFolder));
   };
 
-  const insertImageIntoSourceEditor = async (file: File) => {
-    const result = await saveImageAssetFromFile(file);
-    if (!result || !activeTab) {
+  const insertAssetsIntoSourceEditor = async (
+    files: File[],
+    sourcePaths: Array<string | null> = [],
+    origin: "drop" | "paste" = "paste",
+  ) => {
+    if (!activeTab) {
       return;
     }
 
-    const snippet = createImageMarkdown(result.markdownPath, result.fileName);
+    const results = await Promise.all(
+      files.map((file, index) => saveAssetFromFile(file, sourcePaths[index] ?? null, origin)),
+    );
+    const snippets = results
+      .filter((result): result is NonNullable<typeof result> => Boolean(result))
+      .map((result) =>
+        createAssetMarkdown(result.markdownPath, result.fileName, {
+          image: result.isImage,
+        }),
+      );
+
+    if (snippets.length === 0) {
+      return;
+    }
+
+    const snippet = joinAssetBlocks(snippets);
     const textarea = sourceEditorRef.current;
     const selectionStart = textarea?.selectionStart ?? activeTab.content.length;
     const selectionEnd = textarea?.selectionEnd ?? activeTab.content.length;
@@ -1701,26 +2586,133 @@ export default function App() {
     }
   };
 
+  const insertAssetPathsIntoSourceEditor = useEffectEvent(async (paths: string[]) => {
+    if (!activeTab) {
+      return;
+    }
+
+    const attachablePaths = Array.from(
+      new Set(paths.map(normalizeDroppedPath).filter((path): path is string => Boolean(path))),
+    ).filter((path) => !isMarkdownPath(path));
+    if (attachablePaths.length === 0) {
+      return;
+    }
+
+    const results = await Promise.all(
+      attachablePaths.map((path) => saveAssetFromLocalPath(path, "drop")),
+    );
+    const snippets = results
+      .filter((result): result is NonNullable<typeof result> => Boolean(result))
+      .map((result) =>
+        createAssetMarkdown(result.markdownPath, result.fileName, {
+          image: result.isImage,
+        }),
+      );
+
+    if (snippets.length === 0) {
+      return;
+    }
+
+    const snippet = joinAssetBlocks(snippets);
+    const textarea = sourceEditorRef.current;
+    const selectionStart = textarea?.selectionStart ?? activeTab.content.length;
+    const selectionEnd = textarea?.selectionEnd ?? activeTab.content.length;
+    const before = activeTab.content.slice(0, selectionStart);
+    const after = activeTab.content.slice(selectionEnd);
+    const prefix = before.endsWith("\n") || before.length === 0 ? "" : "\n";
+    const suffix = after.startsWith("\n") || after.length === 0 ? "" : "\n";
+    const inserted = `${prefix}${snippet}${suffix}`;
+    const nextContent = `${before}${inserted}${after}`;
+    const caret = before.length + inserted.length;
+
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === activeTab.id
+          ? {
+              ...tab,
+              content: nextContent,
+              dirty: nextContent !== tab.savedContent,
+            }
+          : tab,
+      ),
+    );
+
+  if (textarea) {
+    window.requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(caret, caret);
+    });
+  }
+  });
+
+  const dispatchDroppedAssetPaths = useEffectEvent(
+    (paths: string[], position: { x: number; y: number }) => {
+      const attachablePaths = Array.from(
+        new Set(paths.map(normalizeDroppedPath).filter((path): path is string => Boolean(path))),
+      ).filter((path) => !isMarkdownPath(path));
+      if (attachablePaths.length === 0) {
+        return;
+      }
+
+      const target = getElementFromPhysicalDropPosition(position);
+      const editorTarget = isEditorDropTarget(target);
+      logAppDrag("native-insert-asset-paths-event", {
+        paths: attachablePaths,
+        target: describeDragTarget(target),
+        editorTarget,
+        editorMode,
+      });
+
+      if (!editorTarget) {
+        setMessage(t.dropMoveToEditorMessage);
+        return;
+      }
+
+      if (editorMode === "source") {
+        void insertAssetPathsIntoSourceEditor(attachablePaths);
+        return;
+      }
+
+      if (editorMode === "rich" && richEditorRoot) {
+        richEditorRoot.dispatchEvent(
+          new CustomEvent<{
+            paths: string[];
+            position: { x: number; y: number };
+          }>(INSERT_DROPPED_ASSET_PATHS_EVENT, {
+            detail: { paths: attachablePaths, position },
+          }),
+        );
+      }
+    },
+  );
+
   const handleSourceEditorPaste = async (
     event: ReactClipboardEvent<HTMLTextAreaElement>,
   ) => {
-    const imageItem = Array.from(event.clipboardData.items).find((item) =>
-      item.type.startsWith("image/"),
+    const files = getAttachableFiles(
+      Array.from(event.clipboardData.items)
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => Boolean(file)),
     );
-    const file = imageItem?.getAsFile();
-    if (!file) {
+    if (files.length === 0) {
       return;
     }
 
     event.preventDefault();
-    await insertImageIntoSourceEditor(file);
+    await insertAssetsIntoSourceEditor(files, [], "paste");
   };
 
   const handleSourceEditorDragOver = (
     event: ReactDragEvent<HTMLTextAreaElement>,
   ) => {
-    const hasImage = Array.from(event.dataTransfer.files).some(isImageFile);
-    if (!hasImage) {
+    if (!hasExternalFileTransfer(event.dataTransfer)) {
+      return;
+    }
+
+    const files = getAttachableFiles(event.dataTransfer.files);
+    const droppedPaths = resolveDroppedPaths(event.dataTransfer);
+    const attachablePaths = droppedPaths.filter((path) => !isMarkdownPath(path));
+    if (files.length === 0 && attachablePaths.length === 0) {
       return;
     }
 
@@ -1731,13 +2723,19 @@ export default function App() {
   const handleSourceEditorDrop = async (
     event: ReactDragEvent<HTMLTextAreaElement>,
   ) => {
-    const file = Array.from(event.dataTransfer.files).find(isImageFile);
-    if (!file) {
+    if (!hasExternalFileTransfer(event.dataTransfer)) {
+      return;
+    }
+
+    const files = getAttachableFiles(event.dataTransfer.files);
+    const droppedPaths = resolveDroppedPaths(event.dataTransfer);
+    const attachablePaths = droppedPaths.filter((path) => !isMarkdownPath(path));
+    if (files.length === 0 && attachablePaths.length === 0) {
       return;
     }
 
     event.preventDefault();
-    await insertImageIntoSourceEditor(file);
+    event.stopPropagation();
   };
 
   const handleChangeLanguage = (nextLanguage: UiLanguage) => {
@@ -1755,7 +2753,7 @@ export default function App() {
 
     const targetTab = contextMenuTab;
     try {
-      await invoke("open_file_location", { path: targetTab.path });
+      await invoke("open_file_location", { path: targetTab.sourcePath });
       setMessage(t.openedFolder(targetTab.title));
     } catch (error) {
       setMessage(t.openFolderFailed(String(error)));
@@ -1773,7 +2771,7 @@ export default function App() {
 
     const targetTab = contextMenuTab;
     try {
-      await copyTextToClipboard(targetTab.path);
+      await copyTextToClipboard(targetTab.sourcePath);
       setMessage(t.copiedFilePath(targetTab.title));
     } catch (error) {
       setMessage(t.copyFailed(String(error)));
@@ -1799,6 +2797,119 @@ export default function App() {
     void handleCloseTab(contextMenuTab.id);
     setTabContextMenu(null);
   };
+
+  useEffect(() => {
+    let unlistenWindow: (() => void) | null = null;
+    let unlistenWebview: (() => void) | null = null;
+
+    const handleNativeDragDropEvent = (
+      source: "window" | "webview",
+      event: {
+        payload:
+          | { type: "enter"; paths: string[]; position: { x: number; y: number } }
+          | { type: "drop"; paths: string[]; position: { x: number; y: number } }
+          | { type: "over"; position: { x: number; y: number } }
+          | { type: "leave" };
+      },
+    ) => {
+      if (event.payload.type === "leave") {
+        return;
+      }
+
+      if (event.payload.type === "enter" || event.payload.type === "drop") {
+        const paths = event.payload.paths
+          .map(normalizeDroppedPath)
+          .filter((path): path is string => Boolean(path));
+        latestNativeDropRef.current = {
+          paths,
+          timestamp: Date.now(),
+        };
+      }
+
+      if (event.payload.type !== "drop") {
+        return;
+      }
+
+      const paths = event.payload.paths
+        .map(normalizeDroppedPath)
+        .filter((path): path is string => Boolean(path));
+      const target = getElementFromPhysicalDropPosition(event.payload.position);
+      const editorTarget = isEditorDropTarget(target);
+      const markdownPaths = getDroppedMarkdownPaths(paths);
+      const hasAttachableNonMarkdown = paths.some((path) => !isMarkdownPath(path));
+
+      logAppDrag("native-file-drop", {
+        source,
+        target: describeDragTarget(target),
+        paths,
+        editorTarget,
+        markdownPaths,
+        hasAttachableNonMarkdown,
+      });
+
+      const assetPaths = paths.filter((path) => !isMarkdownPath(path));
+      const signature = JSON.stringify({
+        markdownPaths,
+        assetPaths,
+        editorTarget,
+      });
+      const now = Date.now();
+      if (
+        lastHandledNativeDropRef.current &&
+        lastHandledNativeDropRef.current.signature === signature &&
+        now - lastHandledNativeDropRef.current.timestamp <= 500
+      ) {
+        logAppDrag("native-file-drop-deduped", {
+          source,
+          signature,
+        });
+        return;
+      }
+
+      lastHandledNativeDropRef.current = {
+        signature,
+        timestamp: now,
+      };
+
+      if (markdownPaths.length > 0) {
+        logAppDrag("native-open-markdown-files-direct", {
+          source,
+          paths: markdownPaths,
+        });
+        void openPaths(markdownPaths);
+        return;
+      }
+
+      if (assetPaths.length > 0) {
+        dispatchDroppedAssetPaths(assetPaths, event.payload.position);
+      }
+    };
+
+    void getCurrentWindow()
+      .onDragDropEvent((event) => {
+        handleNativeDragDropEvent("window", event);
+      })
+      .then((dispose) => {
+        unlistenWindow = dispose;
+      })
+      .catch(() => {});
+
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        handleNativeDragDropEvent("webview", event);
+      })
+      .then((dispose) => {
+        unlistenWebview = dispose;
+      })
+      .catch(() => {});
+
+    return () => {
+      latestNativeDropRef.current = null;
+      lastHandledNativeDropRef.current = null;
+      unlistenWindow?.();
+      unlistenWebview?.();
+    };
+  }, [dispatchDroppedAssetPaths, openPaths]);
 
   useEffect(() => {
     const handleDocumentDragStart = (event: DragEvent) => {
@@ -1836,21 +2947,43 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const hasExternalFiles = (event: DragEvent) =>
-      Array.from(event.dataTransfer?.types ?? []).includes("Files");
+    const hasExternalFiles = (event: DragEvent) => hasExternalFileTransfer(event.dataTransfer);
 
-    const resolveDragKind = (event: DragEvent) => {
+    const resolveDragKind = (event: DragEvent): ExternalDragState => {
       const files = Array.from(event.dataTransfer?.files ?? []);
-      const fileNames = files.map((file) => file.name);
-      if (fileNames.some((name) => /\.(md|markdown)$/i.test(name))) {
-        return "valid" as const;
+      const transferPaths = getDroppedPathsFromDataTransfer(event.dataTransfer);
+      const recentNativeDrop =
+        latestNativeDropRef.current &&
+        Date.now() - latestNativeDropRef.current.timestamp <= NATIVE_DROP_PATH_TTL_MS
+          ? latestNativeDropRef.current.paths
+          : [];
+      const paths = transferPaths.length > 0 ? transferPaths : recentNativeDrop;
+      const candidateNames = Array.from(
+        new Set([
+          ...files.map((file) => file.name.trim()),
+          ...paths.map((path) => getFileName(path).trim()),
+        ].filter(Boolean)),
+      );
+
+      if (candidateNames.length === 0) {
+        return "idle";
       }
 
-      if (files.some(isImageFile)) {
-        return "idle" as const;
+      const hasMarkdown = candidateNames.some(isMarkdownFileName);
+      const hasAttachable = candidateNames.some((name) => !isMarkdownFileName(name));
+      if (isEditorDropTarget(event.target) && hasAttachable) {
+        return "attach";
       }
 
-      return "invalid" as const;
+      if (hasMarkdown) {
+        return "open";
+      }
+
+      if (hasAttachable) {
+        return "moveToEditor";
+      }
+
+      return "invalid";
     };
 
     const clearExternalDragState = () => {
@@ -1872,9 +3005,7 @@ export default function App() {
         files: Array.from(event.dataTransfer?.files ?? []).map((file) => file.name),
       });
       event.preventDefault();
-      if (dragKindRef.current !== "idle") {
-        setDragState(dragKindRef.current);
-      }
+      setDragState(dragKindRef.current);
     };
 
     const handleDocumentDragOver = (event: DragEvent) => {
@@ -1884,11 +3015,7 @@ export default function App() {
 
       event.preventDefault();
       dragKindRef.current = resolveDragKind(event);
-      if (dragKindRef.current !== "idle") {
-        setDragState(dragKindRef.current);
-      } else {
-        setDragState("idle");
-      }
+      setDragState(dragKindRef.current);
     };
 
     const handleDocumentDragLeave = (event: DragEvent) => {
@@ -1906,30 +3033,46 @@ export default function App() {
       }
     };
 
-    const handleDocumentDrop = (event: DragEvent) => {
+    const handleDocumentDrop = async (event: DragEvent) => {
       if (internalDragRef.current || !hasExternalFiles(event)) {
         return;
       }
-
       const files = Array.from(event.dataTransfer?.files ?? []);
-      const paths = getDroppedPathsFromDataTransfer(event.dataTransfer);
+      const dragKind = resolveDragKind(event);
+      const editorTarget = isEditorDropTarget(event.target);
+      const transferPaths = getDroppedPathsFromDataTransfer(event.dataTransfer);
+      const paths = transferPaths.length > 0 ? transferPaths : getRecentNativeDropPaths();
+      const hasAttachableNonMarkdown =
+        getAttachableFiles(files).some((file) => !isMarkdownFile(file)) ||
+        paths.some((path) => !isMarkdownPath(path));
       logAppDrag("document-file-drop", {
         target: describeDragTarget(event.target),
         files: files.map((file) => ({
           name: file.name,
           path: (file as DroppedFileWithPath).path ?? null,
         })),
+        transferTypes: event.dataTransfer ? Array.from(event.dataTransfer.types) : [],
         paths,
+        editorTarget,
+        hasAttachableNonMarkdown,
+        dragKind,
       });
 
-      clearExternalDragState();
       event.preventDefault();
-      if (paths.length > 0) {
-        void handleDroppedPaths(paths);
+      clearExternalDragState();
+
+      if (files.some(isMarkdownFile) || paths.some(isMarkdownPath)) {
+        logAppDrag("document-file-drop-markdown-rust-owned", {
+          target: describeDragTarget(event.target),
+          paths,
+          dragKind,
+        });
         return;
       }
 
-      void handleDroppedFiles(files);
+      if (!editorTarget && hasAttachableNonMarkdown) {
+        setMessage(t.dropMoveToEditorMessage);
+      }
     };
 
     document.addEventListener("dragenter", handleDocumentDragEnter, true);
@@ -1943,7 +3086,7 @@ export default function App() {
       document.removeEventListener("dragleave", handleDocumentDragLeave, true);
       document.removeEventListener("drop", handleDocumentDrop, true);
     };
-  }, [handleDroppedFiles, handleDroppedPaths]);
+  }, [getRecentNativeDropPaths, t.dropMoveToEditorMessage]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2000,6 +3143,13 @@ export default function App() {
               disabled={!activeTab || !activeTab.loaded}
             >
               {t.menuSave}
+            </button>
+            <button
+              type="button"
+              className="menu-button"
+              onClick={handleConfigureImageFolder}
+            >
+              {t.menuImages}
             </button>
             <div className="header-menu" ref={languageMenuRef}>
               <button
@@ -2083,12 +3233,29 @@ export default function App() {
                     key={activeTab.id}
                     docKey={activeTab.id}
                     ref={setRichEditorRoot}
-                    documentPath={activeTab.path}
+                    documentPath={getWorkingDocumentPath(activeTab)}
                     markdown={activeTab.content}
-                    onInsertImage={async (file) => {
-                      const result = await saveImageAssetFromFile(file);
+                    attachmentRevealLabel={t.contextOpenFolder}
+                    attachmentImportingLabel={t.attachmentImporting}
+                    attachmentImportFailedLabel={t.attachmentImportFailed}
+                    onOpenLocalPath={openLocalPathWithConfirmation}
+                    onRevealLocalPath={revealLocalPath}
+                    resolveDroppedSourcePaths={resolveDroppedSourcePaths}
+                    resolveDroppedPaths={resolveDroppedPaths}
+                    onInsertAsset={async (file, sourcePath, origin) => {
+                      const result = await saveAssetFromFile(file, sourcePath, origin);
                       return result
-                        ? createImageMarkdown(result.markdownPath, result.fileName)
+                        ? createAssetMarkdown(result.markdownPath, result.fileName, {
+                            image: result.isImage,
+                          })
+                        : null;
+                    }}
+                    onInsertAssetPath={async (sourcePath, origin) => {
+                      const result = await saveAssetFromLocalPath(sourcePath, origin);
+                      return result
+                        ? createAssetMarkdown(result.markdownPath, result.fileName, {
+                            image: result.isImage,
+                          })
                         : null;
                     }}
                     onChange={(content) => {
@@ -2146,13 +3313,15 @@ export default function App() {
               ? t.working
               : activeTab && !activeTab.loaded
                 ? t.loading
-                : activeTab?.temporary
-                ? activeTab.dirty
-                  ? t.untitledUnsaved
-                  : t.untitled
                 : activeTab?.dirty
-                  ? t.unsaved
-                  : t.saved}
+                  ? isUntitledDraftTab(activeTab)
+                    ? t.untitledUnsaved
+                    : t.unsaved
+                  : canUseLocalFilePath(activeTab)
+                    ? t.saved
+                    : isUntitledDraftTab(activeTab)
+                      ? t.untitled
+                      : t.unsaved}
             </span>
           </div>
         </div>
@@ -2192,13 +3361,17 @@ export default function App() {
 
       {dragState !== "idle" ? (
         <div
-          className={`drag-overlay ${dragState === "valid" ? "is-valid" : "is-invalid"}`}
+          className={`drag-overlay ${dragState === "open" || dragState === "attach" ? "is-valid" : "is-invalid"}`}
         >
           <div className="drag-overlay__card">
             <strong>
-              {dragState === "valid"
+              {dragState === "open"
                 ? t.dropToOpen
-                : t.dropUnsupportedOverlay}
+                : dragState === "attach"
+                  ? t.dropToInsertAssets
+                  : dragState === "moveToEditor"
+                    ? t.dropMoveToEditorOverlay
+                    : t.dropUnsupportedOverlay}
             </strong>
           </div>
         </div>
@@ -2238,6 +3411,49 @@ export default function App() {
           >
             {t.contextClose}
           </button>
+        </div>
+      ) : null}
+
+      {appDialog ? (
+        <div
+          className="app-confirm-dialog-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              closeAppDialog(appDialog.cancelActionId ?? null);
+            }
+          }}
+        >
+          <div
+            className="app-confirm-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="app-confirm-dialog-title"
+            aria-describedby="app-confirm-dialog-message"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="app-confirm-dialog__titlebar">
+              <span id="app-confirm-dialog-title">{appDialog.title}</span>
+            </div>
+            <div className="app-confirm-dialog__body">
+              <p id="app-confirm-dialog-message">{appDialog.message}</p>
+            </div>
+            <div className="app-confirm-dialog__actions">
+              {appDialog.actions.map((action) => (
+                <button
+                  key={action.id}
+                  ref={action.id === appDialog.defaultActionId ? confirmDialogPrimaryButtonRef : null}
+                  type="button"
+                  className={`app-confirm-dialog__button ${
+                    action.tone === "primary" ? "primary-button" : "ghost-button"
+                  }`}
+                  onClick={() => closeAppDialog(action.id)}
+                >
+                  {action.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       ) : null}
     </div>

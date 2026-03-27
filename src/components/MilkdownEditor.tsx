@@ -1,4 +1,5 @@
 import "@milkdown/crepe/theme/common/style.css";
+import "@milkdown/prose/gapcursor/style/gapcursor.css";
 import { parserCtx, schemaCtx } from "@milkdown/core";
 import { Crepe } from "@milkdown/crepe";
 import type { ListenerManager } from "@milkdown/kit/plugin/listener";
@@ -10,12 +11,38 @@ import { forwardRef, useEffect, useRef } from "react";
 import { TextSelection } from "prosemirror-state";
 import { editorViewCtx } from "@milkdown/kit/core";
 import { CustomBlockHandle } from "../lib/customBlockHandle";
+import {
+  attachmentBlockComponent,
+  attachmentBlockConfig,
+} from "../lib/milkdownAttachmentBlock";
 
 type MilkdownEditorProps = {
   documentPath: string | null;
   markdown: string;
   onChange: (markdown: string) => void;
-  onInsertImage: (file: File) => Promise<string | null>;
+  attachmentRevealLabel: string;
+  attachmentImportingLabel: string;
+  attachmentImportFailedLabel: string;
+  onOpenLocalPath: (path: string, label?: string) => Promise<void>;
+  onRevealLocalPath: (path: string, label?: string) => Promise<void>;
+  resolveDroppedSourcePaths: (
+    files: File[],
+    dataTransfer: DataTransfer | null,
+  ) => Array<string | null>;
+  resolveDroppedPaths: (dataTransfer: DataTransfer | null) => string[];
+  onInsertAsset: (
+    file: File,
+    sourcePath: string | null | undefined,
+    origin: "drop" | "paste",
+  ) => Promise<string | null>;
+  onInsertAssetPath: (
+    sourcePath: string,
+    origin: "drop",
+  ) => Promise<string | null>;
+};
+
+type InsertMarkdownOptions = {
+  preferTextCursorAfterAttachment?: boolean;
 };
 
 const markdownClipboardMimeTypes = [
@@ -23,18 +50,6 @@ const markdownClipboardMimeTypes = [
   "text/x-markdown",
   "application/x-markdown",
 ] as const;
-
-type BlockDragLogEntry = {
-  label: string;
-  detail: Record<string, unknown>;
-  timestamp: string;
-};
-
-declare global {
-  interface Window {
-    __TINYMD_BLOCK_DRAG_LOGS__?: BlockDragLogEntry[];
-  }
-}
 
 const normalizeStandaloneDisplayMath = (text: string) => {
   const trimmed = text.trim();
@@ -170,40 +185,78 @@ const getClipboardMarkdown = (clipboardData: DataTransfer) => {
   };
 };
 
-const isImageFile = (file: File) =>
-  file.type.startsWith("image/") ||
-  /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(file.name);
+const isMarkdownFile = (file: File) => /\.(md|markdown)$/i.test(file.name);
 
-const describeEventTarget = (value: EventTarget | null) => {
-  if (!(value instanceof Element)) {
-    return String(value);
-  }
+const isMarkdownPath = (path: string) => /\.(md|markdown)$/i.test(path.trim());
+const INSERT_DROPPED_ASSET_PATHS_EVENT = "insert-dropped-asset-paths";
 
-  const className =
-    typeof value.className === "string"
-      ? value.className
-      : value.getAttribute("class") ?? "";
-  return [value.tagName.toLowerCase(), className].filter(Boolean).join(".");
+type DroppedFileWithPath = File & {
+  path?: string;
 };
 
-const getDataTransferTypes = (event: DragEvent) =>
-  event.dataTransfer ? Array.from(event.dataTransfer.types) : [];
-
-const logBlockDrag = (label: string, detail: Record<string, unknown>) => {
-  const entry: BlockDragLogEntry = {
-    label,
-    detail,
-    timestamp: new Date().toISOString(),
-  };
-
-  const logs = window.__TINYMD_BLOCK_DRAG_LOGS__ ?? [];
-  logs.push(entry);
-  if (logs.length > 200) {
-    logs.splice(0, logs.length - 200);
+const normalizeDroppedPath = (value: string) => {
+  const trimmed = value.trim().replace(/^"+|"+$/g, "");
+  if (!trimmed) {
+    return null;
   }
-  window.__TINYMD_BLOCK_DRAG_LOGS__ = logs;
-  console.debug("[TinyMD:block-drag]", entry);
+
+  let normalized = trimmed;
+
+  if (/^file:\/\//i.test(normalized)) {
+    try {
+      const url = new URL(normalized);
+      normalized = decodeURIComponent(url.pathname);
+      if (/^\/[a-zA-Z]:/.test(normalized)) {
+        normalized = normalized.slice(1);
+      }
+    } catch {
+      normalized = normalized.replace(/^file:\/+/i, "");
+    }
+  } else {
+    try {
+      normalized = decodeURIComponent(normalized);
+    } catch {
+      // Keep the original string if the drag source provided a plain file path.
+    }
+  }
+
+  normalized = normalized.replace(/[?#].*$/, "").replace(/[\\/]+$/, "");
+  return normalized || null;
 };
+
+const getDroppedFilePaths = (dataTransfer: DataTransfer | null) => {
+  if (!dataTransfer) {
+    return [];
+  }
+
+  const directPaths = Array.from(dataTransfer.files)
+    .map((file) => normalizeDroppedPath((file as DroppedFileWithPath).path ?? ""))
+    .filter((path): path is string => Boolean(path));
+
+  if (directPaths.length > 0) {
+    return directPaths;
+  }
+
+  const uriList = dataTransfer.getData("text/uri-list");
+  if (!uriList) {
+    return [];
+  }
+
+  return uriList
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter((value) => value && !value.startsWith("#"))
+    .map(normalizeDroppedPath)
+    .filter((path): path is string => Boolean(path));
+};
+
+const hasExternalFileTransfer = (dataTransfer: DataTransfer | null) =>
+  Array.from(dataTransfer?.types ?? []).includes("Files");
+
+const getAttachableFiles = (files: Iterable<File>) =>
+  Array.from(files).filter((file) => !isMarkdownFile(file));
+
+const joinAssetBlocks = (snippets: string[]) => snippets.join("\n\n");
 
 const resolveRelativePath = (baseFilePath: string, relativePath: string) => {
   const normalizedBase = baseFilePath.replace(/\\/g, "/");
@@ -242,22 +295,29 @@ const resolveMarkdownImagePath = (
     return trimmed;
   }
 
-  if (
-    /^(?:https?:|data:|blob:|asset:|tauri:|mailto:)/i.test(trimmed) ||
-    trimmed.startsWith("//")
-  ) {
-    return trimmed;
+  let normalizedSource = trimmed;
+  try {
+    normalizedSource = decodeURIComponent(trimmed);
+  } catch {
+    normalizedSource = trimmed;
   }
 
-  if (/^[a-zA-Z]:[\\/]/.test(trimmed) || trimmed.startsWith("/")) {
-    return trimmed;
+  if (
+    /^(?:https?:|data:|blob:|asset:|tauri:|mailto:)/i.test(normalizedSource) ||
+    normalizedSource.startsWith("//")
+  ) {
+    return normalizedSource;
+  }
+
+  if (/^[a-zA-Z]:[\\/]/.test(normalizedSource) || normalizedSource.startsWith("/")) {
+    return normalizedSource;
   }
 
   if (!documentPath) {
     return null;
   }
 
-  return resolveRelativePath(documentPath, trimmed);
+  return resolveRelativePath(documentPath, normalizedSource);
 };
 
 const lightCodeMirrorTheme = CodeMirrorView.theme(
@@ -302,25 +362,83 @@ const lightCodeMirrorTheme = CodeMirrorView.theme(
 export const MilkdownEditor = forwardRef<
   HTMLDivElement,
   MilkdownEditorProps & { docKey: string }
->(function MilkdownEditor({ docKey, documentPath, markdown, onChange, onInsertImage }, ref) {
+>(function MilkdownEditor(
+  {
+    docKey,
+    documentPath,
+    markdown,
+    onChange,
+    attachmentRevealLabel,
+    attachmentImportingLabel,
+    attachmentImportFailedLabel,
+    onOpenLocalPath,
+    onRevealLocalPath,
+    resolveDroppedSourcePaths,
+    resolveDroppedPaths,
+    onInsertAsset,
+    onInsertAssetPath,
+  },
+  ref,
+) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<Crepe | null>(null);
   const onChangeRef = useRef(onChange);
-  const onInsertImageRef = useRef(onInsertImage);
+  const attachmentRevealLabelRef = useRef(attachmentRevealLabel);
+  const attachmentImportingLabelRef = useRef(attachmentImportingLabel);
+  const attachmentImportFailedLabelRef = useRef(attachmentImportFailedLabel);
+  const onOpenLocalPathRef = useRef(onOpenLocalPath);
+  const onRevealLocalPathRef = useRef(onRevealLocalPath);
+  const resolveDroppedSourcePathsRef = useRef(resolveDroppedSourcePaths);
+  const resolveDroppedPathsRef = useRef(resolveDroppedPaths);
+  const onInsertAssetRef = useRef(onInsertAsset);
+  const onInsertAssetPathRef = useRef(onInsertAssetPath);
   const documentPathRef = useRef(documentPath);
   const imageSourceCacheRef = useRef(new Map<string, string>());
   const pendingImageLoadsRef = useRef(new Map<string, Promise<string>>());
   const isComposingRef = useRef(false);
   const lastMarkdownRef = useRef(markdown);
   const flushTimerRef = useRef<number | null>(null);
+  const isEditorReadyRef = useRef(false);
 
   useEffect(() => {
     onChangeRef.current = onChange;
   }, [onChange]);
 
   useEffect(() => {
-    onInsertImageRef.current = onInsertImage;
-  }, [onInsertImage]);
+    attachmentRevealLabelRef.current = attachmentRevealLabel;
+  }, [attachmentRevealLabel]);
+
+  useEffect(() => {
+    attachmentImportingLabelRef.current = attachmentImportingLabel;
+  }, [attachmentImportingLabel]);
+
+  useEffect(() => {
+    attachmentImportFailedLabelRef.current = attachmentImportFailedLabel;
+  }, [attachmentImportFailedLabel]);
+
+  useEffect(() => {
+    onOpenLocalPathRef.current = onOpenLocalPath;
+  }, [onOpenLocalPath]);
+
+  useEffect(() => {
+    onRevealLocalPathRef.current = onRevealLocalPath;
+  }, [onRevealLocalPath]);
+
+  useEffect(() => {
+    resolveDroppedSourcePathsRef.current = resolveDroppedSourcePaths;
+  }, [resolveDroppedSourcePaths]);
+
+  useEffect(() => {
+    resolveDroppedPathsRef.current = resolveDroppedPaths;
+  }, [resolveDroppedPaths]);
+
+  useEffect(() => {
+    onInsertAssetRef.current = onInsertAsset;
+  }, [onInsertAsset]);
+
+  useEffect(() => {
+    onInsertAssetPathRef.current = onInsertAssetPath;
+  }, [onInsertAssetPath]);
 
   useEffect(() => {
     documentPathRef.current = documentPath;
@@ -335,11 +453,24 @@ export const MilkdownEditor = forwardRef<
     onChangeRef.current(value);
   };
 
+  const flushMarkdownFromEditor = (editor: Crepe) => {
+    if (!isEditorReadyRef.current || editorRef.current !== editor) {
+      return;
+    }
+
+    try {
+      emitMarkdown(editor.getMarkdown());
+    } catch {
+      // Ignore stale blur/composition callbacks during editor teardown/recreate.
+    }
+  };
+
   useEffect(() => {
     if (!rootRef.current) {
       return;
     }
 
+    isEditorReadyRef.current = false;
     rootRef.current.innerHTML = "";
 
     const editor = new Crepe({
@@ -355,6 +486,22 @@ export const MilkdownEditor = forwardRef<
         },
       },
     });
+
+    editor.editor
+      .use(attachmentBlockComponent)
+      .config((ctx) => {
+        ctx.update(attachmentBlockConfig.key, (value) => ({
+          ...value,
+          getDocumentPath: () => documentPathRef.current,
+          getRevealLocalPathLabel: () => attachmentRevealLabelRef.current,
+          getImportingLabel: () => attachmentImportingLabelRef.current,
+          getImportFailedLabel: () => attachmentImportFailedLabelRef.current,
+          openLocalPath: (path: string, label?: string) =>
+            onOpenLocalPathRef.current(path, label),
+          revealLocalPath: (path: string, label?: string) =>
+            onRevealLocalPathRef.current(path, label),
+        }));
+      });
 
     editor.setReadonly(false);
     editor.on((listener: ListenerManager) => {
@@ -379,7 +526,7 @@ export const MilkdownEditor = forwardRef<
 
         flushTimerRef.current = window.setTimeout(() => {
           flushTimerRef.current = null;
-          emitMarkdown(editor.getMarkdown());
+          flushMarkdownFromEditor(editor);
         }, 0);
       });
     });
@@ -393,16 +540,55 @@ export const MilkdownEditor = forwardRef<
 
       editor.editor.action((ctx) => {
         const view = ctx.get(editorViewCtx);
+        isEditorReadyRef.current = true;
         customBlockHandle = new CustomBlockHandle(ctx);
 
-        const getSelectionSnapshot = () => ({
-          type: view.state.selection.constructor.name,
-          from: view.state.selection.from,
-          to: view.state.selection.to,
-          empty: view.state.selection.empty,
-        });
+        let decorationSyncFrame = 0;
+        const scheduleDecorationSync = () => {
+          if (decorationSyncFrame) {
+            window.cancelAnimationFrame(decorationSyncFrame);
+          }
 
-        const insertMarkdown = (value: string) => {
+          decorationSyncFrame = window.requestAnimationFrame(() => {
+            decorationSyncFrame = 0;
+            syncImageElements();
+
+            // ProseMirror may patch the DOM again on the next frame after insertion.
+            window.requestAnimationFrame(() => {
+              syncImageElements();
+            });
+          });
+        };
+
+        const insertTextCursorAfterAttachment = (transaction: typeof view.state.tr) => {
+          const { selection } = transaction;
+          const $from = selection.$from;
+          const nodeBefore = $from.nodeBefore;
+          const nodeAfter = $from.nodeAfter;
+          const hasAttachmentNeighbor =
+            nodeBefore?.type.name === "attachment" || nodeAfter?.type.name === "attachment";
+
+          if ($from.parent.inlineContent || !hasAttachmentNeighbor) {
+            return transaction;
+          }
+
+          const defaultType = $from.parent.contentMatchAt($from.index()).defaultType;
+          if (!defaultType || !defaultType.isTextblock) {
+            return transaction;
+          }
+
+          const paragraph = defaultType.createAndFill();
+          if (!paragraph) {
+            return transaction;
+          }
+
+          const insertPos = $from.pos;
+          transaction.insert(insertPos, paragraph);
+          transaction.setSelection(TextSelection.near(transaction.doc.resolve(insertPos + 1)));
+          return transaction;
+        };
+
+        const insertMarkdown = (value: string, options?: InsertMarkdownOptions) => {
           const parser = ctx.get(parserCtx);
           const schema = ctx.get(schemaCtx);
           const doc = parser(value);
@@ -416,9 +602,15 @@ export const MilkdownEditor = forwardRef<
           const textNode = isTextOnlySlice(slice);
 
           try {
-            const transaction = textNode
-              ? view.state.tr.replaceSelectionWith(textNode, true)
-              : view.state.tr.replaceSelection(slice);
+            let transaction =
+              textNode
+                ? view.state.tr.replaceSelectionWith(textNode, true)
+                : view.state.tr.replaceSelection(slice);
+
+            if (options?.preferTextCursorAfterAttachment && !textNode) {
+              transaction = insertTextCursorAfterAttachment(transaction);
+            }
+
             view.dispatch(
               transaction
                 .scrollIntoView()
@@ -496,9 +688,23 @@ export const MilkdownEditor = forwardRef<
           });
         };
 
-        const insertImages = async (files: File[], event?: DragEvent) => {
-          const imageFiles = files.filter(isImageFile);
-          if (imageFiles.length === 0) {
+        const insertAssets = async (files: File[], event?: DragEvent) => {
+          const fileList = Array.from(files);
+          const origin: "drop" | "paste" = event ? "drop" : "paste";
+          const sourcePaths = resolveDroppedSourcePathsRef.current(
+            fileList,
+            event?.dataTransfer ?? null,
+          );
+          const attachableEntries = fileList
+            .map((file, index) => ({
+              file,
+              sourcePath:
+                sourcePaths[index] ??
+                normalizeDroppedPath((file as DroppedFileWithPath).path ?? ""),
+            }))
+            .filter((entry) => !isMarkdownFile(entry.file));
+          const attachableFiles = attachableEntries.map((entry) => entry.file);
+          if (attachableFiles.length === 0) {
             return;
           }
 
@@ -517,8 +723,12 @@ export const MilkdownEditor = forwardRef<
           }
 
           const snippets: string[] = [];
-          for (const file of imageFiles) {
-            const markdownSnippet = await onInsertImageRef.current(file);
+          for (const entry of attachableEntries) {
+            const markdownSnippet = await onInsertAssetRef.current(
+              entry.file,
+              entry.sourcePath,
+              origin,
+            );
             if (markdownSnippet) {
               snippets.push(markdownSnippet);
             }
@@ -528,13 +738,56 @@ export const MilkdownEditor = forwardRef<
             return;
           }
 
-          if (!insertMarkdown(snippets.join("\n"))) {
+          if (!insertMarkdown(joinAssetBlocks(snippets), { preferTextCursorAfterAttachment: true })) {
             return;
           }
 
-          window.requestAnimationFrame(() => {
-            syncImageElements();
-          });
+          scheduleDecorationSync();
+        };
+
+        const insertAssetsFromPaths = async (
+          paths: string[],
+          dropPosition?: { x: number; y: number } | null,
+        ) => {
+          const attachablePaths = Array.from(
+            new Set(paths.map(normalizeDroppedPath).filter((path): path is string => Boolean(path))),
+          ).filter((path) => !isMarkdownPath(path));
+          if (attachablePaths.length === 0) {
+            return;
+          }
+
+          if (dropPosition) {
+            const scale = window.devicePixelRatio || 1;
+            const position = view.posAtCoords({
+              left: dropPosition.x / scale,
+              top: dropPosition.y / scale,
+            });
+            if (position) {
+              view.dispatch(
+                view.state.tr.setSelection(
+                  TextSelection.near(view.state.doc.resolve(position.pos)),
+                ),
+              );
+            }
+          }
+
+          const snippets: string[] = [];
+          for (const sourcePath of attachablePaths) {
+            const markdownSnippet = await onInsertAssetPathRef.current(sourcePath, "drop");
+            if (markdownSnippet) {
+              snippets.push(markdownSnippet);
+            }
+          }
+
+          if (snippets.length === 0) {
+            return;
+          }
+
+          if (!insertMarkdown(joinAssetBlocks(snippets), { preferTextCursorAfterAttachment: true })) {
+            return;
+          }
+
+          scheduleDecorationSync();
         };
 
         const handleCompositionStart = () => {
@@ -549,7 +802,7 @@ export const MilkdownEditor = forwardRef<
 
           flushTimerRef.current = window.setTimeout(() => {
             flushTimerRef.current = null;
-            emitMarkdown(editor.getMarkdown());
+            flushMarkdownFromEditor(editor);
           }, 0);
         };
         const handleLinkClick = (event: MouseEvent) => {
@@ -560,13 +813,24 @@ export const MilkdownEditor = forwardRef<
 
           const link = target.closest("a[href]");
           const href = link?.getAttribute("href")?.trim();
-          if (!href) {
+          if (!href || href.startsWith("#")) {
             return;
           }
 
           event.preventDefault();
           event.stopPropagation();
-          void invoke("open_external_url", { url: href });
+
+          if (/^(?:https?:|mailto:)/i.test(href)) {
+            void invoke("open_external_url", { url: href });
+            return;
+          }
+
+          const resolvedPath = resolveMarkdownImagePath(href, documentPathRef.current);
+          if (!resolvedPath) {
+            return;
+          }
+
+          void onOpenLocalPathRef.current(resolvedPath, link?.textContent?.trim());
         };
         const handlePaste = (event: ClipboardEvent) => {
           if (event.defaultPrevented) {
@@ -589,14 +853,15 @@ export const MilkdownEditor = forwardRef<
             return;
           }
 
-          const imageItem = Array.from(clipboardData.items).find((item) =>
-            item.type.startsWith("image/"),
+          const files = getAttachableFiles(
+            Array.from(clipboardData.items)
+              .map((item) => item.getAsFile())
+              .filter((file): file is File => Boolean(file)),
           );
-          const imageFile = imageItem?.getAsFile();
-          if (imageFile) {
+          if (files.length > 0) {
             event.preventDefault();
             event.stopPropagation();
-            void insertImages([imageFile]);
+            void insertAssets(files);
             return;
           }
 
@@ -623,8 +888,15 @@ export const MilkdownEditor = forwardRef<
           event.stopPropagation();
         };
         const handleDragOver = (event: DragEvent) => {
-          const hasImageFile = Array.from(event.dataTransfer?.files ?? []).some(isImageFile);
-          if (!hasImageFile) {
+          if (!hasExternalFileTransfer(event.dataTransfer ?? null)) {
+            return;
+          }
+
+          const files = getAttachableFiles(event.dataTransfer?.files ?? []);
+          const attachablePaths = resolveDroppedPathsRef
+            .current(event.dataTransfer ?? null)
+            .filter((path) => !isMarkdownPath(path));
+          if (files.length === 0 && attachablePaths.length === 0) {
             return;
           }
 
@@ -634,169 +906,35 @@ export const MilkdownEditor = forwardRef<
           }
         };
         const handleDrop = (event: DragEvent) => {
-          const files = Array.from(event.dataTransfer?.files ?? []).filter(isImageFile);
-          if (files.length === 0) {
+          if (!hasExternalFileTransfer(event.dataTransfer ?? null)) {
+            return;
+          }
+
+          const files = getAttachableFiles(event.dataTransfer?.files ?? []);
+          const attachablePaths = resolveDroppedPathsRef
+            .current(event.dataTransfer ?? null)
+            .filter((path) => !isMarkdownPath(path));
+          if (files.length === 0 && attachablePaths.length === 0) {
             return;
           }
 
           event.preventDefault();
           event.stopPropagation();
-          void insertImages(files, event);
         };
 
-        const blockHandleHost = view.dom.parentElement;
-        let removeBlockHandleDebug: (() => void) | null = null;
-        const cleanupBlockHandleDebug = () => {
-          if (!removeBlockHandleDebug) {
+        const handleInsertAssetPaths = (event: Event) => {
+          const customEvent = event as CustomEvent<{
+            paths?: string[];
+            position?: { x: number; y: number };
+          }>;
+          const paths = Array.isArray(customEvent.detail?.paths)
+            ? customEvent.detail.paths.filter((path): path is string => typeof path === "string")
+            : [];
+          if (paths.length === 0) {
             return;
           }
 
-          const cleanup = removeBlockHandleDebug;
-          removeBlockHandleDebug = null;
-          cleanup();
-        };
-        const attachBlockHandleDebug = () => {
-          const handle =
-            blockHandleHost?.querySelector<HTMLDivElement>(".milkdown-block-handle") ?? null;
-          if (!handle || handle.dataset.tinymdDebugBound === "true") {
-            return;
-          }
-
-          handle.dataset.tinymdDebugBound = "true";
-          logBlockDrag("handle-attached", {
-            draggable: handle.draggable,
-            childCount: handle.children.length,
-            items: Array.from(handle.children).map((child, index) => ({
-              index,
-              target: describeEventTarget(child),
-            })),
-          });
-
-          const handlePointerDown = (event: PointerEvent) => {
-            logBlockDrag("handle-pointerdown", {
-              button: event.button,
-              buttons: event.buttons,
-              target: describeEventTarget(event.target),
-              currentTarget: describeEventTarget(event.currentTarget),
-              show: handle.dataset.show ?? null,
-              selection: getSelectionSnapshot(),
-            });
-          };
-
-          const handleMouseDown = (event: MouseEvent) => {
-            logBlockDrag("handle-mousedown", {
-              button: event.button,
-              buttons: event.buttons,
-              target: describeEventTarget(event.target),
-              currentTarget: describeEventTarget(event.currentTarget),
-              show: handle.dataset.show ?? null,
-              selection: getSelectionSnapshot(),
-            });
-          };
-
-          const handleDragStart = (event: DragEvent) => {
-            logBlockDrag("handle-dragstart", {
-              target: describeEventTarget(event.target),
-              currentTarget: describeEventTarget(event.currentTarget),
-              show: handle.dataset.show ?? null,
-              draggable: handle.draggable,
-              effectAllowed: event.dataTransfer?.effectAllowed ?? null,
-              dropEffect: event.dataTransfer?.dropEffect ?? null,
-              types: getDataTransferTypes(event),
-              selection: getSelectionSnapshot(),
-              editorDragging: view.dom.dataset.dragging ?? null,
-            });
-          };
-
-          const handleDragEnd = (event: DragEvent) => {
-            logBlockDrag("handle-dragend", {
-              target: describeEventTarget(event.target),
-              currentTarget: describeEventTarget(event.currentTarget),
-              effectAllowed: event.dataTransfer?.effectAllowed ?? null,
-              dropEffect: event.dataTransfer?.dropEffect ?? null,
-              types: getDataTransferTypes(event),
-              selection: getSelectionSnapshot(),
-              editorDragging: view.dom.dataset.dragging ?? null,
-            });
-          };
-
-          const handleMouseUp = (event: MouseEvent) => {
-            logBlockDrag("handle-mouseup", {
-              button: event.button,
-              buttons: event.buttons,
-              target: describeEventTarget(event.target),
-              currentTarget: describeEventTarget(event.currentTarget),
-              selection: getSelectionSnapshot(),
-              editorDragging: view.dom.dataset.dragging ?? null,
-            });
-          };
-
-          const handleAttrChange = new MutationObserver(() => {
-            logBlockDrag("handle-visibility", {
-              show: handle.dataset.show ?? null,
-              left: handle.style.left || null,
-              top: handle.style.top || null,
-            });
-          });
-          handleAttrChange.observe(handle, {
-            attributes: true,
-            attributeFilter: ["data-show"],
-          });
-
-          handle.addEventListener("pointerdown", handlePointerDown, true);
-          handle.addEventListener("mousedown", handleMouseDown, true);
-          handle.addEventListener("mouseup", handleMouseUp, true);
-          handle.addEventListener("dragstart", handleDragStart, true);
-          handle.addEventListener("dragend", handleDragEnd, true);
-
-          removeBlockHandleDebug = () => {
-            handle.removeEventListener("pointerdown", handlePointerDown, true);
-            handle.removeEventListener("mousedown", handleMouseDown, true);
-            handle.removeEventListener("mouseup", handleMouseUp, true);
-            handle.removeEventListener("dragstart", handleDragStart, true);
-            handle.removeEventListener("dragend", handleDragEnd, true);
-            handleAttrChange.disconnect();
-            delete handle.dataset.tinymdDebugBound;
-          };
-        };
-
-        const handleDebugObserver = new MutationObserver(() => {
-          attachBlockHandleDebug();
-        });
-        if (blockHandleHost) {
-          handleDebugObserver.observe(blockHandleHost, {
-            childList: true,
-            subtree: true,
-          });
-          window.requestAnimationFrame(() => {
-            attachBlockHandleDebug();
-          });
-        }
-
-        const handleEditorDragOverDebug = (event: DragEvent) => {
-          logBlockDrag("editor-dragover", {
-            target: describeEventTarget(event.target),
-            currentTarget: describeEventTarget(event.currentTarget),
-            effectAllowed: event.dataTransfer?.effectAllowed ?? null,
-            dropEffect: event.dataTransfer?.dropEffect ?? null,
-            types: getDataTransferTypes(event),
-            files: event.dataTransfer?.files.length ?? 0,
-            selection: getSelectionSnapshot(),
-            editorDragging: view.dom.dataset.dragging ?? null,
-          });
-        };
-
-        const handleEditorDropDebug = (event: DragEvent) => {
-          logBlockDrag("editor-drop", {
-            target: describeEventTarget(event.target),
-            currentTarget: describeEventTarget(event.currentTarget),
-            effectAllowed: event.dataTransfer?.effectAllowed ?? null,
-            dropEffect: event.dataTransfer?.dropEffect ?? null,
-            types: getDataTransferTypes(event),
-            files: event.dataTransfer?.files.length ?? 0,
-            selection: getSelectionSnapshot(),
-            editorDragging: view.dom.dataset.dragging ?? null,
-          });
+          void insertAssetsFromPaths(paths, customEvent.detail?.position ?? null);
         };
 
         view.dom.addEventListener("compositionstart", handleCompositionStart);
@@ -805,50 +943,49 @@ export const MilkdownEditor = forwardRef<
         view.dom.addEventListener("paste", handlePaste, true);
         view.dom.addEventListener("dragover", handleDragOver);
         view.dom.addEventListener("drop", handleDrop);
-        view.dom.addEventListener("dragover", handleEditorDragOverDebug, true);
-        view.dom.addEventListener("drop", handleEditorDropDebug, true);
+        rootRef.current?.addEventListener(INSERT_DROPPED_ASSET_PATHS_EVENT, handleInsertAssetPaths);
 
         const imageObserver = new MutationObserver(() => {
-          window.requestAnimationFrame(() => {
-            syncImageElements();
-          });
+          scheduleDecorationSync();
         });
         imageObserver.observe(view.dom, {
           childList: true,
           subtree: true,
         });
-        syncImageElements();
+        scheduleDecorationSync();
 
         if (disposed) {
+          if (decorationSyncFrame) {
+            window.cancelAnimationFrame(decorationSyncFrame);
+            decorationSyncFrame = 0;
+          }
           view.dom.removeEventListener("compositionstart", handleCompositionStart);
           view.dom.removeEventListener("compositionend", handleCompositionEnd);
           view.dom.removeEventListener("click", handleLinkClick);
           view.dom.removeEventListener("paste", handlePaste, true);
           view.dom.removeEventListener("dragover", handleDragOver);
           view.dom.removeEventListener("drop", handleDrop);
-          view.dom.removeEventListener("dragover", handleEditorDragOverDebug, true);
-          view.dom.removeEventListener("drop", handleEditorDropDebug, true);
+          rootRef.current?.removeEventListener(INSERT_DROPPED_ASSET_PATHS_EVENT, handleInsertAssetPaths);
           customBlockHandle?.destroy();
           customBlockHandle = null;
-          cleanupBlockHandleDebug();
-          handleDebugObserver.disconnect();
           imageObserver.disconnect();
         }
 
         const previousDestroy = editor.destroy;
         editor.destroy = () => {
+          if (decorationSyncFrame) {
+            window.cancelAnimationFrame(decorationSyncFrame);
+            decorationSyncFrame = 0;
+          }
           view.dom.removeEventListener("compositionstart", handleCompositionStart);
           view.dom.removeEventListener("compositionend", handleCompositionEnd);
           view.dom.removeEventListener("click", handleLinkClick);
           view.dom.removeEventListener("paste", handlePaste, true);
           view.dom.removeEventListener("dragover", handleDragOver);
           view.dom.removeEventListener("drop", handleDrop);
-          view.dom.removeEventListener("dragover", handleEditorDragOverDebug, true);
-          view.dom.removeEventListener("drop", handleEditorDropDebug, true);
+          rootRef.current?.removeEventListener(INSERT_DROPPED_ASSET_PATHS_EVENT, handleInsertAssetPaths);
           customBlockHandle?.destroy();
           customBlockHandle = null;
-          cleanupBlockHandleDebug();
-          handleDebugObserver.disconnect();
           imageObserver.disconnect();
           return previousDestroy();
         };
@@ -860,6 +997,7 @@ export const MilkdownEditor = forwardRef<
     return () => {
       disposed = true;
       isComposingRef.current = false;
+      isEditorReadyRef.current = false;
       if (flushTimerRef.current !== null) {
         window.clearTimeout(flushTimerRef.current);
         flushTimerRef.current = null;
