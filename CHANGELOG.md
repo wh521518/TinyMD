@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0-beat.6 - 2026-03-28
+
+- Added single-instance startup handling so repeated launches reactivate the existing main window instead of spawning duplicate app processes.
+- Forwarded Markdown file arguments from a blocked second launch to the running instance, preserving file-association opens while the app is already running.
+- Switched the close confirmation dialog to default to keeping the app in the system tray, including default focus and Enter-key behavior.
+
 ## 1.0.0-beat.5 - 2026-03-27
 
 - Added block-style attachment cards in Milkdown, with file metadata, context menu actions, and native block handle compatibility.

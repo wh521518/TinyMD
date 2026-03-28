@@ -238,6 +238,7 @@ const STREAMED_ASSET_UPLOAD_CHUNK_BYTES = 1024 * 1024;
 const NATIVE_DROP_PATH_TTL_MS = 2000;
 const APP_CLOSE_INTENT_EVENT = "app-close-intent";
 const TRAY_REQUEST_EXIT_EVENT = "tray-request-exit";
+const OPEN_REQUESTED_MARKDOWN_FILES_EVENT = "open-requested-markdown-files";
 const ASSET_IMPORT_STATUS_EVENT = "asset-import-status";
 const OPEN_DROPPED_MARKDOWN_FILES_EVENT = "open-dropped-markdown-files";
 const INSERT_DROPPED_ASSET_PATHS_EVENT = "insert-dropped-asset-paths";
@@ -1178,10 +1179,10 @@ export default function App() {
       message: t.confirmCloseAction,
       actions: [
         { id: "cancel", label: t.closeActionCancel, tone: "ghost" },
-        { id: "tray", label: t.closeActionTray, tone: "ghost" },
-        { id: "exit", label: t.closeActionExit, tone: "primary" },
+        { id: "tray", label: t.closeActionTray, tone: "primary" },
+        { id: "exit", label: t.closeActionExit, tone: "ghost" },
       ],
-      defaultActionId: "exit",
+      defaultActionId: "tray",
       cancelActionId: "cancel",
     });
 
@@ -1286,6 +1287,10 @@ export default function App() {
       setBusy(false);
     }
   };
+
+  const handleOpenRequestedPaths = useEffectEvent((paths: string[]) => {
+    void openPaths(paths);
+  });
 
   const handleOpenFiles = async () => {
     const result = await open({
@@ -1611,6 +1616,29 @@ export default function App() {
 
     void listen(TRAY_REQUEST_EXIT_EVENT, () => {
       void exitApplication();
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    void listen<string[]>(OPEN_REQUESTED_MARKDOWN_FILES_EVENT, (event) => {
+      const paths = Array.isArray(event.payload)
+        ? event.payload.filter(
+            (path): path is string => typeof path === "string" && path.trim().length > 0,
+          )
+        : [];
+      if (paths.length === 0) {
+        return;
+      }
+
+      handleOpenRequestedPaths(paths);
     }).then((dispose) => {
       unlisten = dispose;
     });

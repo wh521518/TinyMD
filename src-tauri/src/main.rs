@@ -1,4 +1,7 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -32,6 +35,7 @@ const TRAY_SHOW_ID: &str = "tray-show";
 const TRAY_QUIT_ID: &str = "tray-quit";
 const TRAY_REQUEST_EXIT_EVENT: &str = "tray-request-exit";
 const APP_CLOSE_INTENT_EVENT: &str = "app-close-intent";
+const OPEN_REQUESTED_MARKDOWN_FILES_EVENT: &str = "open-requested-markdown-files";
 const ASSET_IMPORT_STATUS_EVENT: &str = "asset-import-status";
 const OPEN_DROPPED_MARKDOWN_FILES_EVENT: &str = "open-dropped-markdown-files";
 const INSERT_DROPPED_ASSET_PATHS_EVENT: &str = "insert-dropped-asset-paths";
@@ -239,6 +243,43 @@ fn normalize(path: PathBuf) -> String {
     path.to_string_lossy().to_string()
 }
 
+fn restore_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn collect_markdown_files<I, S>(args: I, cwd: Option<&Path>) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+
+    for arg in args {
+        let mut path = PathBuf::from(arg.into());
+        if path.is_relative() {
+            if let Some(base_dir) = cwd {
+                path = base_dir.join(path);
+            }
+        }
+
+        if !path.is_file() || !is_markdown(&path) {
+            continue;
+        }
+
+        let normalized = normalize(path);
+        if seen.insert(normalized.clone()) {
+            files.push(normalized);
+        }
+    }
+
+    files
+}
+
 fn read_file(path: &str) -> Result<String, String> {
     fs::read_to_string(path).map_err(|err| format!("无法读取文件 {path}: {err}"))
 }
@@ -299,9 +340,7 @@ fn sanitize_image_dir(value: &str) -> Result<PathBuf, String> {
 fn sanitize_asset_stem(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     for ch in value.trim().chars() {
-        if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
-            || ch.is_control()
-        {
+        if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control() {
             sanitized.push('-');
         } else {
             sanitized.push(ch);
@@ -369,7 +408,10 @@ fn build_unique_asset_path(
     }
 }
 
-fn resolve_asset_directory_path(document_path: &str, assets_dir: &str) -> Result<(PathBuf, PathBuf), String> {
+fn resolve_asset_directory_path(
+    document_path: &str,
+    assets_dir: &str,
+) -> Result<(PathBuf, PathBuf), String> {
     let document = PathBuf::from(document_path);
     if !is_markdown(&document) {
         return Err(format!("仅支持为 Markdown 文档保存附件: {document_path}"));
@@ -400,8 +442,7 @@ fn resolve_asset_target_path(
 }
 
 fn legacy_state_dir() -> Result<PathBuf, String> {
-    let exe_path = std::env::current_exe()
-        .map_err(|err| format!("无法定位应用安装目录: {err}"))?;
+    let exe_path = std::env::current_exe().map_err(|err| format!("无法定位应用安装目录: {err}"))?;
     let parent = exe_path
         .parent()
         .ok_or_else(|| "无法定位应用安装目录".to_string())?;
@@ -411,8 +452,7 @@ fn legacy_state_dir() -> Result<PathBuf, String> {
 fn fallback_data_dir_with_name(app_name: &str) -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
-        let app_data = env::var_os("APPDATA")
-            .ok_or_else(|| "无法读取 APPDATA 目录".to_string())?;
+        let app_data = env::var_os("APPDATA").ok_or_else(|| "无法读取 APPDATA 目录".to_string())?;
         return Ok(PathBuf::from(app_data).join(app_name));
     }
 
@@ -455,12 +495,8 @@ fn migrate_state_root(source_root: &Path, target_root: &Path) -> Result<(), Stri
         return Ok(());
     }
 
-    fs::create_dir_all(target_root).map_err(|err| {
-        format!(
-            "无法创建应用数据目录 {}: {err}",
-            target_root.display()
-        )
-    })?;
+    fs::create_dir_all(target_root)
+        .map_err(|err| format!("无法创建应用数据目录 {}: {err}", target_root.display()))?;
 
     let target_session = target_root.join(SESSION_FILE_NAME);
     if !target_session.exists() {
@@ -479,12 +515,8 @@ fn migrate_state_root(source_root: &Path, target_root: &Path) -> Result<(), Stri
     let legacy_temp_docs = source_root.join(TEMP_DOCS_DIR_NAME);
     if legacy_temp_docs.exists() {
         let target_temp_docs = target_root.join(TEMP_DOCS_DIR_NAME);
-        fs::create_dir_all(&target_temp_docs).map_err(|err| {
-            format!(
-                "无法创建临时文档目录 {}: {err}",
-                target_temp_docs.display()
-            )
-        })?;
+        fs::create_dir_all(&target_temp_docs)
+            .map_err(|err| format!("无法创建临时文档目录 {}: {err}", target_temp_docs.display()))?;
 
         let entries = fs::read_dir(&legacy_temp_docs).map_err(|err| {
             format!(
@@ -616,7 +648,10 @@ fn recover_file_tab(tab: &EditorTabState) -> EditorTabState {
         id: recovered_tab_id(&tab.id),
         path: None,
         source_path: None,
-        title: recovered_tab_title(tab.source_path.as_deref().or(tab.path.as_deref()), &tab.title),
+        title: recovered_tab_title(
+            tab.source_path.as_deref().or(tab.path.as_deref()),
+            &tab.title,
+        ),
         content: tab.content.clone(),
         saved_content: tab.saved_content.clone(),
         dirty: true,
@@ -664,12 +699,8 @@ fn copy_temp_assets_and_rewrite(
     let target_doc_dir = target_doc_path
         .parent()
         .ok_or_else(|| format!("无法定位文档目录: {}", target_doc_path.display()))?;
-    fs::create_dir_all(target_doc_dir).map_err(|err| {
-        format!(
-            "无法创建文档目录 {}: {err}",
-            target_doc_dir.display()
-        )
-    })?;
+    fs::create_dir_all(target_doc_dir)
+        .map_err(|err| format!("无法创建文档目录 {}: {err}", target_doc_dir.display()))?;
 
     let mut rewritten = content.to_string();
     let mut pending = vec![temp_doc_dir.to_path_buf()];
@@ -695,29 +726,23 @@ fn copy_temp_assets_and_rewrite(
                 continue;
             }
 
-            let relative_source = source_path
-                .strip_prefix(temp_doc_dir)
-                .map_err(|err| {
-                    format!(
-                        "无法计算临时资源相对路径 {}: {err}",
-                        source_path.display()
-                    )
-                })?;
+            let relative_source = source_path.strip_prefix(temp_doc_dir).map_err(|err| {
+                format!("无法计算临时资源相对路径 {}: {err}", source_path.display())
+            })?;
             let destination_path = target_doc_dir.join(relative_source);
             let destination_dir = destination_path
                 .parent()
                 .ok_or_else(|| format!("无法定位目标资源目录: {}", destination_path.display()))?;
             fs::create_dir_all(destination_dir).map_err(|err| {
-                format!(
-                    "无法创建目标资源目录 {}: {err}",
-                    destination_dir.display()
-                )
+                format!("无法创建目标资源目录 {}: {err}", destination_dir.display())
             })?;
 
             let final_destination = if destination_path.exists() {
                 build_unique_asset_path(
                     destination_dir,
-                    destination_path.file_name().and_then(|value| value.to_str()),
+                    destination_path
+                        .file_name()
+                        .and_then(|value| value.to_str()),
                     "attachment",
                     None,
                 )
@@ -787,9 +812,8 @@ fn sync_temp_docs(app: &AppHandle, session: &EditorSessionState) -> Result<(), S
         let file_name = entry.file_name().to_string_lossy().to_string();
         if path.is_dir() {
             if !active_dirs.contains(&file_name) {
-                fs::remove_dir_all(&path).map_err(|err| {
-                    format!("无法删除旧临时文档目录 {}: {err}", path.display())
-                })?;
+                fs::remove_dir_all(&path)
+                    .map_err(|err| format!("无法删除旧临时文档目录 {}: {err}", path.display()))?;
             }
             continue;
         }
@@ -871,22 +895,8 @@ fn read_markdown_file(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn get_launch_markdown_files() -> Vec<String> {
-    let mut files = Vec::new();
-    let mut seen = HashSet::new();
-
-    for arg in env::args_os().skip(1) {
-        let path = PathBuf::from(arg);
-        if !path.is_file() || !is_markdown(&path) {
-            continue;
-        }
-
-        let normalized = normalize(path);
-        if seen.insert(normalized.clone()) {
-            files.push(normalized);
-        }
-    }
-
-    files
+    let cwd = env::current_dir().ok();
+    collect_markdown_files(env::args_os().skip(1), cwd.as_deref())
 }
 
 #[tauri::command]
@@ -1170,8 +1180,8 @@ fn read_image_data_url(path: String) -> Result<String, String> {
 
     let mime_type = image_mime_type(&target)
         .ok_or_else(|| format!("不支持的图片格式: {}", target.display()))?;
-    let bytes = fs::read(&target)
-        .map_err(|err| format!("无法读取图片文件 {}: {err}", target.display()))?;
+    let bytes =
+        fs::read(&target).map_err(|err| format!("无法读取图片文件 {}: {err}", target.display()))?;
     let encoded = BASE64_STANDARD.encode(bytes);
     Ok(format!("data:{mime_type};base64,{encoded}"))
 }
@@ -1614,7 +1624,11 @@ fn queue_asset_import_from_path(
     std::thread::spawn(move || {
         let copy_result = fs::copy(&source, &target_path).map(|_| ());
 
-        if let Ok(mut reserved) = event_app.state::<AppLifecycleState>().pending_asset_imports.lock() {
+        if let Ok(mut reserved) = event_app
+            .state::<AppLifecycleState>()
+            .pending_asset_imports
+            .lock()
+        {
             reserved.remove(&target_path);
         }
 
@@ -1716,10 +1730,21 @@ fn move_main_window_to_tray(app: AppHandle) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            restore_main_window(app);
+
+            let cwd = PathBuf::from(cwd);
+            let markdown_files = collect_markdown_files(args, Some(cwd.as_path()));
+            if !markdown_files.is_empty() {
+                let _ = app.emit(OPEN_REQUESTED_MARKDOWN_FILES_EVENT, markdown_files);
+            }
+        }))
         .manage(AppLifecycleState::default())
         .setup(|app| {
-            let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示 TinyMD", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "退出 TinyMD", true, None::<&str>)?;
+            let show_item =
+                MenuItem::with_id(app, TRAY_SHOW_ID, "显示 TinyMD", true, None::<&str>)?;
+            let quit_item =
+                MenuItem::with_id(app, TRAY_QUIT_ID, "退出 TinyMD", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
             let icon = app
                 .default_window_icon()
@@ -1732,11 +1757,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     TRAY_SHOW_ID => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                        restore_main_window(app);
                     }
                     TRAY_QUIT_ID => {
                         let _ = app.emit(TRAY_REQUEST_EXIT_EVENT, ());
@@ -1750,11 +1771,7 @@ fn main() {
                         ..
                     } = event
                     {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                        restore_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
@@ -1796,7 +1813,10 @@ fn main() {
             append_drag_debug_log(
                 &webview.app_handle(),
                 "webview-drag-drop",
-                &format!("position=({}, {}), paths={normalized_paths:?}", position.x, position.y),
+                &format!(
+                    "position=({}, {}), paths={normalized_paths:?}",
+                    position.x, position.y
+                ),
             );
 
             let markdown_paths = normalized_paths
