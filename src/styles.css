@@ -251,6 +251,21 @@ button {
   word-break: break-word;
 }
 
+.app-confirm-dialog__setting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  color: #1a1a1a;
+  font-size: 12px;
+  line-height: 1.4;
+  user-select: none;
+}
+
+.app-confirm-dialog__setting input {
+  margin: 0;
+}
+
 .app-confirm-dialog__actions {
   display: flex;
   justify-content: flex-end;

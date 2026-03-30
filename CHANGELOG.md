@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0-beat.7 - 2026-03-30
+
+- Added recently closed tab tracking with `Ctrl+Shift+T` restore support, including recovery for saved and temporary documents.
+- Reworked app close handling into a configurable flow with `Ask Every Time`, `Exit`, and `Keep in Tray` preferences.
+- Added a close dialog option to remember the selected exit behavior so the app can persist the user’s preferred close action.
+
 ## 1.0.0-beat.6 - 2026-03-28
 
 - Added single-instance startup handling so repeated launches reactivate the existing main window instead of spawning duplicate app processes.

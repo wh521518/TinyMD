@@ -24,7 +24,7 @@ import {
   publishAttachmentImportState,
   type AttachmentImportState,
 } from "./lib/attachmentImportState";
-import type { EditorTab } from "./types";
+import type { EditorTab, TabStorageKind } from "./types";
 
 const getFileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const normalizeDroppedPath = (value: string) => {
@@ -245,8 +245,17 @@ const INSERT_DROPPED_ASSET_PATHS_EVENT = "insert-dropped-asset-paths";
 const RECOVERED_PREFIX = "recovered:";
 const LANGUAGE_STORAGE_KEY = "tinymd.language";
 const IMAGE_FOLDER_STORAGE_KEY = "tinymd.imageFolder";
+const CLOSE_ACTION_STORAGE_KEY = "tinymd.closeAction";
+const RECENTLY_CLOSED_TABS_STORAGE_KEY = "tinymd.recentlyClosedTabs";
+const MAX_RECENTLY_CLOSED_TABS = 10;
 const DEFAULT_IMAGE_FOLDER = "_assets";
 const LEGACY_DEFAULT_IMAGE_FOLDER = "assets";
+const TAB_STORAGE_KINDS: readonly TabStorageKind[] = [
+  "saved",
+  "draft",
+  "temporaryFile",
+  "recovered",
+];
 
 type AppDragLogEntry = {
   label: string;
@@ -332,10 +341,54 @@ const getRecoveredTabId = (id: string) =>
 const getRecoveredTabTitle = (title: string, suffix: string) =>
   title.endsWith(suffix) ? title : `${title}${suffix}`;
 
+const getRecentlyClosedTabKey = (tab: RecentlyClosedTab) => tab.sourcePath ?? tab.path ?? tab.id;
+
+const createRestorableClosedTab = (tab: EditorTab): RecentlyClosedTab => ({
+  ...tab,
+  loaded: true,
+});
+
+const createDiscardedClosedTab = (tab: EditorTab): RecentlyClosedTab | null => {
+  if (!canUseLocalFilePath(tab)) {
+    return null;
+  }
+
+  return {
+    ...tab,
+    id: tab.sourcePath,
+    path: tab.sourcePath,
+    sourcePath: tab.sourcePath,
+    title: getFileName(tab.sourcePath),
+    content: tab.savedContent,
+    savedContent: tab.savedContent,
+    dirty: false,
+    storageKind: "saved",
+    loaded: true,
+  };
+};
+
+const canRestoreClosedTab = (tab: RecentlyClosedTab) =>
+  hasPersistedSourcePath(tab.sourcePath) || Boolean(tab.content) || Boolean(tab.savedContent);
+
+const getUniqueRestoredTabId = (baseId: string, existingTabs: EditorTab[]) => {
+  let nextId = baseId;
+  let index = 1;
+
+  while (existingTabs.some((tab) => tab.id === nextId)) {
+    nextId = `${baseId}:${index}`;
+    index += 1;
+  }
+
+  return nextId;
+};
+
 type EditorSession = {
   tabs: EditorTab[];
   activeTabId: string | null;
 };
+
+type CloseActionPreference = "ask" | "exit" | "tray";
+type RecentlyClosedTab = EditorTab;
 
 type LoadedEditorSession = EditorSession & {
   warnings: string[];
@@ -363,12 +416,23 @@ type AppDialogAction = {
   tone?: "primary" | "ghost";
 };
 
+type AppDialogSetting = {
+  label: string;
+  checked: boolean;
+};
+
+type AppDialogResult = {
+  actionId: string | null;
+  settingChecked: boolean;
+};
+
 type AppDialogState = {
   title: string;
   message: string;
   actions: AppDialogAction[];
   defaultActionId?: string;
   cancelActionId?: string;
+  setting?: AppDialogSetting;
 };
 
 type UiText = {
@@ -376,6 +440,7 @@ type UiText = {
   menuNew: string;
   menuSave: string;
   menuImages: string;
+  menuCloseAction: string;
   menuLanguage: string;
   languageChinese: string;
   languageEnglish: string;
@@ -465,10 +530,17 @@ type UiText = {
   confirmCloseDirtyTab: (title: string) => string;
   confirmCloseDirtyWindow: (count: number) => string;
   confirmCloseAction: string;
+  closeActionAsk: string;
   closeActionExit: string;
   closeActionTray: string;
   closeActionCancel: string;
+  closeActionRemember: string;
+  closeActionSetToAsk: string;
+  closeActionSetToExit: string;
+  closeActionSetToTray: string;
   minimizedToTray: string;
+  reopenedClosedTab: (title: string) => string;
+  noRecentlyClosedTab: string;
   unsavedSave: string;
   unsavedDiscard: string;
   unsavedCancel: string;
@@ -480,6 +552,7 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     menuNew: "新建(N)",
     menuSave: "保存(S)",
     menuImages: "附件(I)",
+    menuCloseAction: "关闭动作(C)",
     menuLanguage: "语言(L)",
     languageChinese: "简体中文",
     languageEnglish: "English",
@@ -575,10 +648,17 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     confirmCloseDirtyWindow: (count) =>
       `当前有 ${count} 个未保存文档。关闭应用前先保存吗？`,
     confirmCloseAction: "关闭 TinyMD 时，是否退出应用，还是保存到托盘？",
+    closeActionAsk: "每次询问",
     closeActionExit: "退出",
     closeActionTray: "保存到托盘",
     closeActionCancel: "取消",
+    closeActionRemember: "记住本次选择",
+    closeActionSetToAsk: "关闭窗口时会询问执行动作。",
+    closeActionSetToExit: "关闭窗口时将直接退出应用。",
+    closeActionSetToTray: "关闭窗口时将保存到托盘。",
     minimizedToTray: "应用已最小化到系统托盘。",
+    reopenedClosedTab: (title) => `已恢复最近关闭的 ${title}`,
+    noRecentlyClosedTab: "没有可恢复的最近关闭文档。",
     unsavedSave: "保存",
     unsavedDiscard: "不保存",
     unsavedCancel: "取消",
@@ -588,6 +668,7 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     menuNew: "New(N)",
     menuSave: "Save(S)",
     menuImages: "Attachments(I)",
+    menuCloseAction: "Close Action(C)",
     menuLanguage: "Language(L)",
     languageChinese: "简体中文",
     languageEnglish: "English",
@@ -685,14 +766,47 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     confirmCloseDirtyWindow: (count) =>
       `${count} document(s) have unsaved changes. Save before closing the app?`,
     confirmCloseAction: "When closing TinyMD, do you want to exit or keep it in the tray?",
+    closeActionAsk: "Ask Every Time",
     closeActionExit: "Exit",
     closeActionTray: "Keep in Tray",
     closeActionCancel: "Cancel",
+    closeActionRemember: "Remember this choice",
+    closeActionSetToAsk: "Closing the window will ask what to do.",
+    closeActionSetToExit: "Closing the window will exit the app.",
+    closeActionSetToTray: "Closing the window will keep TinyMD in the tray.",
     minimizedToTray: "TinyMD was minimized to the system tray.",
+    reopenedClosedTab: (title) => `Reopened recently closed ${title}`,
+    noRecentlyClosedTab: "There are no recently closed documents to restore.",
     unsavedSave: "Save",
     unsavedDiscard: "Don't Save",
     unsavedCancel: "Cancel",
   },
+};
+
+const isCloseActionPreference = (
+  value: string | null | undefined,
+): value is CloseActionPreference => value === "ask" || value === "exit" || value === "tray";
+
+const isTabStorageKind = (value: unknown): value is TabStorageKind =>
+  typeof value === "string" && TAB_STORAGE_KINDS.includes(value as TabStorageKind);
+
+const isRecentlyClosedTab = (value: unknown): value is RecentlyClosedTab => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const tab = value as Partial<Record<keyof EditorTab, unknown>>;
+  return (
+    typeof tab.id === "string" &&
+    (typeof tab.path === "string" || tab.path === null) &&
+    (typeof tab.sourcePath === "string" || tab.sourcePath === null) &&
+    typeof tab.title === "string" &&
+    typeof tab.content === "string" &&
+    typeof tab.savedContent === "string" &&
+    typeof tab.dirty === "boolean" &&
+    isTabStorageKind(tab.storageKind) &&
+    typeof tab.loaded === "boolean"
+  );
 };
 
 const getInitialLanguage = (): UiLanguage => {
@@ -749,6 +863,43 @@ const getInitialImageFolder = () => {
   }
 
   return sanitized;
+};
+
+const getInitialCloseActionPreference = (): CloseActionPreference => {
+  if (typeof window === "undefined") {
+    return "ask";
+  }
+
+  const stored = window.localStorage.getItem(CLOSE_ACTION_STORAGE_KEY);
+  return isCloseActionPreference(stored) ? stored : "ask";
+};
+
+const getInitialRecentlyClosedTabs = (): RecentlyClosedTab[] => {
+  if (typeof window === "undefined") {
+    return [];
+  }
+
+  const stored = window.localStorage.getItem(RECENTLY_CLOSED_TABS_STORAGE_KEY);
+  if (!stored) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(stored);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed
+      .filter(isRecentlyClosedTab)
+      .map((tab) => ({
+        ...tab,
+        loaded: true,
+      }))
+      .slice(0, MAX_RECENTLY_CLOSED_TABS);
+  } catch {
+    return [];
+  }
 };
 
 const formatAssetSize = (sizeBytes: number) => {
@@ -999,11 +1150,17 @@ const getRichHeadingElements = (root: HTMLDivElement | null) =>
 export default function App() {
   const initialLanguageRef = useRef<UiLanguage>(getInitialLanguage());
   const initialImageFolderRef = useRef(getInitialImageFolder());
+  const initialCloseActionPreferenceRef = useRef(getInitialCloseActionPreference());
+  const initialRecentlyClosedTabsRef = useRef(getInitialRecentlyClosedTabs());
   const dragKindRef = useRef<ExternalDragState>("idle");
   const dragDepthRef = useRef(0);
   const internalDragRef = useRef(false);
   const tabsRef = useRef<EditorTab[]>([]);
+  const recentlyClosedTabsRef = useRef<RecentlyClosedTab[]>(initialRecentlyClosedTabsRef.current);
   const activeTabIdRef = useRef<string | null>(null);
+  const closeActionPreferenceRef = useRef<CloseActionPreference>(
+    initialCloseActionPreferenceRef.current,
+  );
   const allowWindowCloseRef = useRef(false);
   const loadingTabIdsRef = useRef(new Set<string>());
   const sessionReadyRef = useRef(false);
@@ -1014,12 +1171,20 @@ export default function App() {
   } | null>(null);
   const pendingAssetImportsRef = useRef(new Map<string, Set<string>>());
   const pendingAssetImportWaitersRef = useRef(new Map<string, Set<() => void>>());
-  const appDialogResolverRef = useRef<((result: string | null) => void) | null>(null);
+  const appDialogResolverRef = useRef<((result: AppDialogResult) => void) | null>(null);
+  const appDialogSettingCheckedRef = useRef(false);
   const confirmDialogPrimaryButtonRef = useRef<HTMLButtonElement | null>(null);
   const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const closeActionMenuRef = useRef<HTMLDivElement | null>(null);
   const languageMenuRef = useRef<HTMLDivElement | null>(null);
   const [language, setLanguage] = useState<UiLanguage>(initialLanguageRef.current);
   const [imageFolder, setImageFolder] = useState(initialImageFolderRef.current);
+  const [closeActionPreference, setCloseActionPreference] = useState<CloseActionPreference>(
+    initialCloseActionPreferenceRef.current,
+  );
+  const [recentlyClosedTabs, setRecentlyClosedTabs] = useState<RecentlyClosedTab[]>(
+    initialRecentlyClosedTabsRef.current,
+  );
   const [tabs, setTabs] = useState<EditorTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1029,6 +1194,7 @@ export default function App() {
   const [activeOutlineId, setActiveOutlineId] = useState<string | null>(null);
   const [richEditorRoot, setRichEditorRoot] = useState<HTMLDivElement | null>(null);
   const [tabContextMenu, setTabContextMenu] = useState<TabContextMenuState | null>(null);
+  const [closeActionMenuOpen, setCloseActionMenuOpen] = useState(false);
   const [languageMenuOpen, setLanguageMenuOpen] = useState(false);
   const [appDialog, setAppDialog] = useState<AppDialogState | null>(null);
   const [message, setMessage] = useState(
@@ -1054,17 +1220,24 @@ export default function App() {
     const resolver = appDialogResolverRef.current;
     appDialogResolverRef.current = null;
     setAppDialog(null);
-    resolver?.(result);
+    resolver?.({
+      actionId: result,
+      settingChecked: appDialogSettingCheckedRef.current,
+    });
   });
 
   const showAppDialog = useEffectEvent(
     (dialog: AppDialogState) =>
-      new Promise<string | null>((resolve) => {
+      new Promise<AppDialogResult>((resolve) => {
         const pending = appDialogResolverRef.current;
         if (pending) {
-          pending(null);
+          pending({
+            actionId: null,
+            settingChecked: false,
+          });
         }
 
+        appDialogSettingCheckedRef.current = dialog.setting?.checked ?? false;
         appDialogResolverRef.current = resolve;
         setAppDialog(dialog);
       }),
@@ -1088,7 +1261,7 @@ export default function App() {
         cancelActionId: "cancel",
       });
 
-      return result === "ok";
+      return result.actionId === "ok";
     },
   );
 
@@ -1162,18 +1335,21 @@ export default function App() {
       cancelActionId: "cancel",
     });
 
-    if (result === "save") {
+    if (result.actionId === "save") {
       return "save";
     }
 
-    if (result === "discard") {
+    if (result.actionId === "discard") {
       return "discard";
     }
 
     return "cancel";
   };
 
-  const promptCloseAction = async (): Promise<"exit" | "tray" | "cancel"> => {
+  const promptCloseAction = useEffectEvent(async (): Promise<{
+    action: "exit" | "tray" | "cancel";
+    remember: boolean;
+  }> => {
     const result = await showAppDialog({
       title: APP_NAME,
       message: t.confirmCloseAction,
@@ -1184,18 +1360,24 @@ export default function App() {
       ],
       defaultActionId: "tray",
       cancelActionId: "cancel",
+      setting: {
+        label: t.closeActionRemember,
+        checked: false,
+      },
     });
 
-    if (result === "exit") {
-      return "exit";
+    if (result.actionId === "exit" || result.actionId === "tray") {
+      return {
+        action: result.actionId,
+        remember: result.settingChecked,
+      };
     }
 
-    if (result === "tray") {
-      return "tray";
-    }
-
-    return "cancel";
-  };
+    return {
+      action: "cancel",
+      remember: false,
+    };
+  });
 
   const saveEditorSessionSnapshot = useEffectEvent(async (
     sessionTabs = tabsRef.current,
@@ -1220,8 +1402,26 @@ export default function App() {
   }, [tabs]);
 
   useEffect(() => {
+    recentlyClosedTabsRef.current = recentlyClosedTabs;
+
+    try {
+      window.localStorage.setItem(
+        RECENTLY_CLOSED_TABS_STORAGE_KEY,
+        JSON.stringify(recentlyClosedTabs),
+      );
+    } catch (error) {
+      console.warn("[TinyMD] failed to persist recently closed tabs", error);
+    }
+  }, [recentlyClosedTabs]);
+
+  useEffect(() => {
     activeTabIdRef.current = activeTabId;
   }, [activeTabId]);
+
+  useEffect(() => {
+    closeActionPreferenceRef.current = closeActionPreference;
+    window.localStorage.setItem(CLOSE_ACTION_STORAGE_KEY, closeActionPreference);
+  }, [closeActionPreference]);
 
   useEffect(() => {
     window.localStorage.setItem(IMAGE_FOLDER_STORAGE_KEY, imageFolder);
@@ -1243,7 +1443,7 @@ export default function App() {
         setActiveTabId(targetTab?.id ?? lastExisting);
         setMessage(t.switchedTo(targetTab?.title ?? getFileName(lastExisting)));
       }
-      return;
+      return true;
     }
 
     setBusy(true);
@@ -1281,8 +1481,10 @@ export default function App() {
           ? t.openedFile(loadedTabs[0].title)
           : t.openedFiles(loadedTabs.length),
       );
+      return true;
     } catch (error) {
       setMessage(t.openFailed(String(error)));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -1312,14 +1514,14 @@ export default function App() {
     await openPaths(paths);
   };
 
-  const handleSaveTab = async (tab = activeTab) => {
+  const handleSaveTab = async (tab = activeTab): Promise<EditorTab | null> => {
     if (!tab) {
-      return false;
+      return null;
     }
 
     if (!tab.loaded) {
       setMessage(t.loadingBeforeSave(tab.title));
-      return false;
+      return null;
     }
 
     setBusy(true);
@@ -1335,7 +1537,7 @@ export default function App() {
 
         if (!result || Array.isArray(result)) {
           setMessage(t.saveCanceled);
-          return false;
+          return null;
         }
 
         targetPath = String(result);
@@ -1346,7 +1548,7 @@ export default function App() {
       );
       if (conflict) {
         setMessage(t.saveConflict(getFileName(targetPath)));
-        return false;
+        return null;
       }
 
       if (usesTemporaryDocumentStorage(tab)) {
@@ -1368,30 +1570,32 @@ export default function App() {
         });
       }
 
+      const nextTab: EditorTab = {
+        ...tab,
+        id: targetPath!,
+        path: targetPath!,
+        sourcePath: targetPath!,
+        title: getFileName(targetPath!),
+        content: nextContent,
+        savedContent: nextContent,
+        dirty: false,
+        storageKind: "saved",
+        loaded: true,
+      };
+
       setTabs((current) =>
         current.map((item) =>
           item.id === tab.id
-            ? {
-                ...item,
-                id: targetPath!,
-                path: targetPath!,
-                sourcePath: targetPath!,
-                title: getFileName(targetPath!),
-                content: nextContent,
-                savedContent: nextContent,
-                dirty: false,
-                storageKind: "saved",
-                loaded: true,
-              }
+            ? nextTab
             : item,
         ),
       );
       setActiveTabId(targetPath);
       setMessage(t.saveSuccess(getFileName(targetPath)));
-      return true;
+      return nextTab;
     } catch (error) {
       setMessage(t.saveFailed(String(error)));
-      return false;
+      return null;
     } finally {
       setBusy(false);
     }
@@ -1406,6 +1610,88 @@ export default function App() {
       return next;
     });
   };
+
+  const queueRecentlyClosedTab = useEffectEvent((tab: RecentlyClosedTab | null) => {
+    if (!tab || !canRestoreClosedTab(tab)) {
+      return;
+    }
+
+    setRecentlyClosedTabs((current) => {
+      const next = [
+        tab,
+        ...current.filter((item) => getRecentlyClosedTabKey(item) !== getRecentlyClosedTabKey(tab)),
+      ];
+      return next.slice(0, MAX_RECENTLY_CLOSED_TABS);
+    });
+  });
+
+  const restoreRecentlyClosedTab = useEffectEvent(async (snapshot: RecentlyClosedTab) => {
+    if (hasPersistedSourcePath(snapshot.sourcePath)) {
+      const restored = await openPaths([snapshot.sourcePath]);
+      if (restored) {
+        setMessage(t.reopenedClosedTab(getFileName(snapshot.sourcePath)));
+        return true;
+      }
+    }
+
+    const snapshotContent = snapshot.content || snapshot.savedContent;
+    if (!snapshotContent) {
+      return false;
+    }
+
+    const existingTabs = tabsRef.current;
+    const isRecoveredFallback = hasPersistedSourcePath(snapshot.sourcePath);
+    const nextTab: EditorTab = isRecoveredFallback
+      ? {
+          id: getUniqueRestoredTabId(
+            getRecoveredTabId(`${snapshot.id}:${Date.now()}`),
+            existingTabs,
+          ),
+          path: null,
+          sourcePath: null,
+          title: getRecoveredTabTitle(snapshot.title, t.recoveredSuffix),
+          content: snapshotContent,
+          savedContent: snapshotContent,
+          dirty: true,
+          storageKind: "recovered",
+          loaded: true,
+        }
+      : {
+          id: getUniqueRestoredTabId(
+            snapshot.id.startsWith(TEMP_PREFIX) ? snapshot.id : `${TEMP_PREFIX}${Date.now()}`,
+            existingTabs,
+          ),
+          path: null,
+          sourcePath: null,
+          title: snapshot.title,
+          content: snapshotContent,
+          savedContent: snapshot.savedContent,
+          dirty: snapshot.dirty,
+          storageKind: snapshot.storageKind === "recovered" ? "recovered" : "draft",
+          loaded: true,
+        };
+
+    setTabs((current) => [...current, nextTab]);
+    setActiveTabId(nextTab.id);
+    setMessage(
+      isRecoveredFallback ? t.fileRecovered(snapshot.title) : t.reopenedClosedTab(nextTab.title),
+    );
+    return true;
+  });
+
+  const handleRestoreRecentlyClosedTab = useEffectEvent(async () => {
+    const [snapshot, ...rest] = recentlyClosedTabsRef.current;
+    if (!snapshot) {
+      setMessage(t.noRecentlyClosedTab);
+      return;
+    }
+
+    const restored = await restoreRecentlyClosedTab(snapshot);
+    setRecentlyClosedTabs(rest);
+    if (!restored) {
+      setMessage(t.noRecentlyClosedTab);
+    }
+  });
 
   const cleanupTemporaryTab = async (tab: EditorTab) => {
     if (!usesTemporaryDocumentStorage(tab)) {
@@ -1423,6 +1709,9 @@ export default function App() {
       return;
     }
 
+    let closedTabId = targetTab.id;
+    let closedTabSnapshot: RecentlyClosedTab | null = createRestorableClosedTab(targetTab);
+
     if (targetTab.dirty) {
       const decision = await promptUnsavedDecision(
         t.confirmCloseDirtyTab(targetTab.title),
@@ -1432,31 +1721,35 @@ export default function App() {
       }
 
       if (decision === "save") {
-        const saved = await handleSaveTab(targetTab);
-        if (!saved) {
+        const savedTab = await handleSaveTab(targetTab);
+        if (!savedTab) {
           return;
         }
+        closedTabId = savedTab.id;
+        closedTabSnapshot = createRestorableClosedTab(savedTab);
       } else {
+        closedTabSnapshot = createDiscardedClosedTab(targetTab);
         await cleanupTemporaryTab(targetTab);
       }
     }
 
-    closeTabImmediately(targetTab.id);
+    closeTabImmediately(closedTabId);
+    queueRecentlyClosedTab(closedTabSnapshot);
   };
 
-  const exitApplication = async () => {
+  const exitApplication = useEffectEvent(async () => {
     const persisted = await saveEditorSessionSnapshot();
     if (!persisted) {
       return;
     }
 
     await invoke("request_app_exit");
-  };
+  });
 
-  const moveToTray = async () => {
+  const moveToTray = useEffectEvent(async () => {
     await invoke("move_main_window_to_tray");
     setMessage(t.minimizedToTray);
-  };
+  });
 
   const handleCreateDocument = () => {
     const index = tabs.filter((tab) => isUntitledDraftTab(tab)).length + 1;
@@ -1725,15 +2018,31 @@ export default function App() {
 
       handlingClose = true;
       try {
-        const action = await promptCloseAction();
-        if (action === "exit") {
+        if (closeActionPreferenceRef.current === "ask") {
+          const result = await promptCloseAction();
+          if (result.action === "cancel") {
+            return;
+          }
+
+          if (result.remember) {
+            setCloseActionPreference(result.action);
+          }
+
+          if (result.action === "exit") {
+            await exitApplication();
+            return;
+          }
+
+          await moveToTray();
+          return;
+        }
+
+        if (closeActionPreferenceRef.current === "exit") {
           await exitApplication();
           return;
         }
 
-        if (action === "tray") {
-          await moveToTray();
-        }
+        await moveToTray();
       } finally {
         handlingClose = false;
       }
@@ -1744,7 +2053,7 @@ export default function App() {
     return () => {
       unlisten?.();
     };
-  }, [language, t]);
+  }, []);
 
   useEffect(() => {
     if (!showOutline || editorMode !== "source") {
@@ -2045,6 +2354,36 @@ export default function App() {
   }, [languageMenuOpen]);
 
   useEffect(() => {
+    if (!closeActionMenuOpen) {
+      return;
+    }
+
+    const closeMenu = () => setCloseActionMenuOpen(false);
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && closeActionMenuRef.current?.contains(target)) {
+        return;
+      }
+      closeMenu();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeMenu();
+      }
+    };
+
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("blur", closeMenu);
+
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("blur", closeMenu);
+    };
+  }, [closeActionMenuOpen]);
+
+  useEffect(() => {
     if (!tabContextMenu) {
       return;
     }
@@ -2114,7 +2453,10 @@ export default function App() {
   useEffect(() => () => {
     const resolver = appDialogResolverRef.current;
     appDialogResolverRef.current = null;
-    resolver?.(null);
+    resolver?.({
+      actionId: null,
+      settingChecked: false,
+    });
   }, []);
 
   const saveAssetFromLocalPath = async (
@@ -2768,8 +3110,21 @@ export default function App() {
 
   const handleChangeLanguage = (nextLanguage: UiLanguage) => {
     setLanguage(nextLanguage);
+    setCloseActionMenuOpen(false);
     setLanguageMenuOpen(false);
     setMessage(UI_TEXT[nextLanguage].languageChanged);
+  };
+
+  const handleChangeCloseAction = (nextAction: CloseActionPreference) => {
+    setCloseActionPreference(nextAction);
+    setCloseActionMenuOpen(false);
+    setLanguageMenuOpen(false);
+    if (nextAction === "ask") {
+      setMessage(t.closeActionSetToAsk);
+      return;
+    }
+
+    setMessage(nextAction === "exit" ? t.closeActionSetToExit : t.closeActionSetToTray);
   };
 
   const handleOpenTabFolder = async () => {
@@ -3123,6 +3478,12 @@ export default function App() {
       }
 
       const key = event.key.toLowerCase();
+      if (key === "t" && event.shiftKey) {
+        event.preventDefault();
+        void handleRestoreRecentlyClosedTab();
+        return;
+      }
+
       if (key === "s") {
         event.preventDefault();
         void handleSaveTab();
@@ -3179,13 +3540,61 @@ export default function App() {
             >
               {t.menuImages}
             </button>
+            <div className="header-menu" ref={closeActionMenuRef}>
+              <button
+                type="button"
+                className={`menu-button ${closeActionMenuOpen ? "is-active" : ""}`}
+                aria-haspopup="menu"
+                aria-expanded={closeActionMenuOpen}
+                onClick={() => {
+                  setLanguageMenuOpen(false);
+                  setCloseActionMenuOpen((current) => !current);
+                }}
+              >
+                {t.menuCloseAction}
+              </button>
+              {closeActionMenuOpen ? (
+                <div className="menu-popup" role="menu">
+                  <button
+                    type="button"
+                    className={`menu-popup__item ${
+                      closeActionPreference === "ask" ? "is-active" : ""
+                    }`}
+                    onClick={() => handleChangeCloseAction("ask")}
+                  >
+                    {t.closeActionAsk}
+                  </button>
+                  <button
+                    type="button"
+                    className={`menu-popup__item ${
+                      closeActionPreference === "tray" ? "is-active" : ""
+                    }`}
+                    onClick={() => handleChangeCloseAction("tray")}
+                  >
+                    {t.closeActionTray}
+                  </button>
+                  <button
+                    type="button"
+                    className={`menu-popup__item ${
+                      closeActionPreference === "exit" ? "is-active" : ""
+                    }`}
+                    onClick={() => handleChangeCloseAction("exit")}
+                  >
+                    {t.closeActionExit}
+                  </button>
+                </div>
+              ) : null}
+            </div>
             <div className="header-menu" ref={languageMenuRef}>
               <button
                 type="button"
                 className={`menu-button ${languageMenuOpen ? "is-active" : ""}`}
                 aria-haspopup="menu"
                 aria-expanded={languageMenuOpen}
-                onClick={() => setLanguageMenuOpen((current) => !current)}
+                onClick={() => {
+                  setCloseActionMenuOpen(false);
+                  setLanguageMenuOpen((current) => !current);
+                }}
               >
                 {t.menuLanguage}
               </button>
@@ -3465,6 +3874,30 @@ export default function App() {
             </div>
             <div className="app-confirm-dialog__body">
               <p id="app-confirm-dialog-message">{appDialog.message}</p>
+              {appDialog.setting ? (
+                <label className="app-confirm-dialog__setting">
+                  <input
+                    type="checkbox"
+                    checked={appDialog.setting.checked}
+                    onChange={(event) => {
+                      const checked = event.target.checked;
+                      appDialogSettingCheckedRef.current = checked;
+                      setAppDialog((current) =>
+                        current?.setting
+                          ? {
+                              ...current,
+                              setting: {
+                                ...current.setting,
+                                checked,
+                              },
+                            }
+                          : current,
+                      );
+                    }}
+                  />
+                  <span>{appDialog.setting.label}</span>
+                </label>
+              ) : null}
             </div>
             <div className="app-confirm-dialog__actions">
               {appDialog.actions.map((action) => (
