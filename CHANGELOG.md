@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0-beat.8 - 2026-03-30
+
+- Reworked block handle dragging to use pointer-based reordering, fixing the blocked drag cursor issue inside the editor.
+- Rebuilt the current-line block menu to match the native slash menu style while keeping actions scoped to the current block instead of inserting a new line.
+- Fixed current-line menu positioning and scroll behavior so the menu no longer stretches the page or closes unexpectedly on wheel scroll.
+
 ## 1.0.0-beat.7 - 2026-03-30
 
 - Added recently closed tab tracking with `Ctrl+Shift+T` restore support, including recovery for saved and temporary documents.

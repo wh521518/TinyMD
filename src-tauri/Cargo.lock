@@ -2967,7 +2967,7 @@ dependencies = [
 
 [[package]]
 name = "rust-milkdown"
-version = "1.0.0-beat.7"
+version = "1.0.0-beat.8"
 dependencies = [
  "base64 0.22.1",
  "serde",

@@ -1154,7 +1154,6 @@ export default function App() {
   const initialRecentlyClosedTabsRef = useRef(getInitialRecentlyClosedTabs());
   const dragKindRef = useRef<ExternalDragState>("idle");
   const dragDepthRef = useRef(0);
-  const internalDragRef = useRef(false);
   const tabsRef = useRef<EditorTab[]>([]);
   const recentlyClosedTabsRef = useRef<RecentlyClosedTab[]>(initialRecentlyClosedTabsRef.current);
   const activeTabIdRef = useRef<string | null>(null);
@@ -3295,41 +3294,6 @@ export default function App() {
   }, [dispatchDroppedAssetPaths, openPaths]);
 
   useEffect(() => {
-    const handleDocumentDragStart = (event: DragEvent) => {
-      const target = event.target;
-      const isInsideApp =
-        target instanceof Element ? Boolean(target.closest(".app-shell")) : false;
-      const hasFiles = Boolean(event.dataTransfer?.files.length);
-      internalDragRef.current = isInsideApp && !hasFiles;
-      logAppDrag("document-dragstart", {
-        target: describeDragTarget(target),
-        isInsideApp,
-        hasFiles,
-        types: event.dataTransfer ? Array.from(event.dataTransfer.types) : [],
-        internal: internalDragRef.current,
-      });
-    };
-
-    const clearInternalDrag = (event: DragEvent) => {
-      logAppDrag("document-drag-end", {
-        target: describeDragTarget(event.target),
-        internal: internalDragRef.current,
-      });
-      internalDragRef.current = false;
-    };
-
-    document.addEventListener("dragstart", handleDocumentDragStart, true);
-    document.addEventListener("dragend", clearInternalDrag, true);
-    document.addEventListener("drop", clearInternalDrag, true);
-
-    return () => {
-      document.removeEventListener("dragstart", handleDocumentDragStart, true);
-      document.removeEventListener("dragend", clearInternalDrag, true);
-      document.removeEventListener("drop", clearInternalDrag, true);
-    };
-  }, []);
-
-  useEffect(() => {
     const hasExternalFiles = (event: DragEvent) => hasExternalFileTransfer(event.dataTransfer);
 
     const resolveDragKind = (event: DragEvent): ExternalDragState => {
@@ -3376,7 +3340,7 @@ export default function App() {
     };
 
     const handleDocumentDragEnter = (event: DragEvent) => {
-      if (internalDragRef.current || !hasExternalFiles(event)) {
+      if (!hasExternalFiles(event)) {
         return;
       }
 
@@ -3392,7 +3356,7 @@ export default function App() {
     };
 
     const handleDocumentDragOver = (event: DragEvent) => {
-      if (internalDragRef.current || !hasExternalFiles(event)) {
+      if (!hasExternalFiles(event)) {
         return;
       }
 
@@ -3402,7 +3366,7 @@ export default function App() {
     };
 
     const handleDocumentDragLeave = (event: DragEvent) => {
-      if (internalDragRef.current || !hasExternalFiles(event)) {
+      if (!hasExternalFiles(event)) {
         return;
       }
 
@@ -3417,7 +3381,7 @@ export default function App() {
     };
 
     const handleDocumentDrop = async (event: DragEvent) => {
-      if (internalDragRef.current || !hasExternalFiles(event)) {
+      if (!hasExternalFiles(event)) {
         return;
       }
       const files = Array.from(event.dataTransfer?.files ?? []);

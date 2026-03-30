@@ -1044,6 +1044,11 @@ button {
   cursor: grabbing;
 }
 
+.milkdown .milkdown-block-handle.custom-block-handle[data-pointer-dragging="true"] {
+  opacity: 0;
+  pointer-events: none;
+}
+
 .milkdown
   .milkdown-block-handle.custom-block-handle
   .operation-item.custom-block-handle__trigger:focus-visible {
@@ -1075,50 +1080,65 @@ button {
   fill: currentColor;
 }
 
-.milkdown .milkdown-block-handle.custom-block-handle .custom-block-handle__menu {
-  position: absolute;
-  top: calc(100% + 8px);
-  left: 0;
-  min-width: 136px;
-  padding: 6px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--panel);
-  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.2);
+.milkdown .custom-block-handle__menu {
+  z-index: 160;
+}
+
+.milkdown .custom-block-handle__menu .menu-groups {
+  max-height: min(420px, calc(100vh - 40px));
+}
+
+.milkdown .custom-block-handle__menu .menu-group li.custom-block-handle__menu-item--danger {
+  color: #b43b3b;
 }
 
 .milkdown
-  .milkdown-block-handle.custom-block-handle
-  .custom-block-handle__menu-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text);
-  text-align: left;
-}
-
-.milkdown
-  .milkdown-block-handle.custom-block-handle
-  .custom-block-handle__menu-item:hover {
-  background: var(--hover);
-}
-
-.milkdown .milkdown-block-handle.custom-block-handle .custom-block-handle__menu-icon {
-  display: inline-flex;
-  width: 14px;
-  height: 14px;
-}
-
-.milkdown
-  .milkdown-block-handle.custom-block-handle
-  .custom-block-handle__menu-icon
+  .custom-block-handle__menu
+  .menu-group
+  li.custom-block-handle__menu-item--danger
   svg {
-  width: 14px;
-  height: 14px;
+  color: #b43b3b;
+  fill: #b43b3b;
+}
+
+.milkdown
+  .custom-block-handle__menu
+  .menu-group
+  li.custom-block-handle__menu-item--danger.hover,
+.milkdown
+  .custom-block-handle__menu
+  .menu-group
+  li.custom-block-handle__menu-item--danger.active {
+  background: #fff1f1;
+}
+
+body.custom-block-handle--dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.milkdown .custom-block-handle__drag-source {
+  opacity: 0.72;
+}
+
+.custom-block-handle__drop-indicator {
+  position: fixed;
+  z-index: 160;
+  height: 0;
+  border-top: 2px solid var(--text);
+  pointer-events: none;
+  transform: translateY(-1px);
+}
+
+.custom-block-handle__drop-indicator::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: -5px;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--text);
 }
 
 .milkdown .milkdown-toolbar {
