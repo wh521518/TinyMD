@@ -1,7 +1,7 @@
 {
   "name": "rust-milkdown",
   "private": true,
-  "version": "1.0.0-beat.8",
+  "version": "1.0.0-beat.9",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 1420",

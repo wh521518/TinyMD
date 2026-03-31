@@ -1,0 +1,86 @@
+.milkdown .milkdown-slash-menu,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu {
+  border-radius: 9px;
+}
+
+.milkdown .milkdown-slash-menu .tab-group,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .tab-group {
+  padding: 6px 6px 0;
+}
+
+.milkdown .milkdown-slash-menu .tab-group ul,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .tab-group ul {
+  gap: 4px;
+  padding: 4px 5px 6px;
+}
+
+.milkdown .milkdown-slash-menu .tab-group ul li,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .tab-group ul li {
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.milkdown .milkdown-slash-menu .menu-groups,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .menu-groups {
+  max-height: min(300px, calc(100vh - 28px));
+  padding: 0 6px 6px;
+}
+
+.milkdown .milkdown-slash-menu .menu-groups .menu-group h6,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .menu-group h6 {
+  padding: 8px 8px 4px;
+  font-size: 10px;
+  line-height: 13px;
+  letter-spacing: 0.04em;
+}
+
+.milkdown .milkdown-slash-menu .menu-groups .menu-group li,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .menu-group li {
+  min-width: 176px;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 5px;
+}
+
+.milkdown .milkdown-slash-menu .menu-groups .menu-group li svg,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .menu-group li svg {
+  width: 16px;
+  height: 16px;
+}
+
+.milkdown .milkdown-slash-menu .menu-groups .menu-group li > span,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .menu-group li > span {
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.milkdown .milkdown-slash-menu .menu-groups .menu-group + .menu-group::before,
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .menu-group + .menu-group::before {
+  margin: 0 6px;
+}
+
+.milkdown .milkdown-slash-menu.custom-block-handle__menu .menu-group li.custom-block-handle__menu-item--danger {
+  color: #b43b3b;
+}
+
+.milkdown
+  .milkdown-slash-menu.custom-block-handle__menu
+  .menu-group
+  li.custom-block-handle__menu-item--danger
+  svg {
+  color: #b43b3b;
+  fill: #b43b3b;
+}
+
+.milkdown
+  .milkdown-slash-menu.custom-block-handle__menu
+  .menu-group
+  li.custom-block-handle__menu-item--danger.hover,
+.milkdown
+  .milkdown-slash-menu.custom-block-handle__menu
+  .menu-group
+  li.custom-block-handle__menu-item--danger.active {
+  background: #fff1f1;
+}

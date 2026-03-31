@@ -224,6 +224,7 @@ const DEFAULT_FILTER_NODES: FilterNodes = (_pos, node) => {
 const POINTER_DRAG_THRESHOLD_PX = 4;
 const EDGE_AUTO_SCROLL_BUFFER_PX = 40;
 const EDGE_AUTO_SCROLL_STEP_PX = 18;
+const HANDLE_GAP_PX = 10;
 const MENU_OFFSET_PX = 10;
 
 const FORMAT_MENU_GROUPS: readonly FormatMenuGroup[] = [
@@ -473,6 +474,78 @@ const selectRootNodeByCoords = (
   } catch {
     return null;
   }
+};
+
+const getSelectionPositionCandidates = (view: EditorView) => {
+  const { doc, selection } = view.state;
+  const positions = new Set<number>();
+
+  const push = (pos: number) => {
+    if (pos < 0 || pos > doc.content.size) {
+      return;
+    }
+
+    positions.add(pos);
+  };
+
+  push(selection.from);
+  push(selection.to);
+  push(selection.$from.pos);
+  push(selection.$to.pos);
+
+  if (selection.from < doc.content.size) {
+    push(selection.from + 1);
+  }
+
+  if (selection.to < doc.content.size) {
+    push(selection.to + 1);
+  }
+
+  if (selection.from > 0) {
+    push(selection.from - 1);
+  }
+
+  if (selection.to > 0) {
+    push(selection.to - 1);
+  }
+
+  return Array.from(positions);
+};
+
+const getSelectionAnchorRect = (view: EditorView) => {
+  for (const pos of getSelectionPositionCandidates(view)) {
+    try {
+      const coords = view.coordsAtPos(pos);
+      return {
+        bottom: coords.bottom,
+        left: coords.left,
+        right: coords.right,
+        top: coords.top,
+      };
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+};
+
+const selectRootNodeBySelection = (ctx: Ctx): ActiveBlockNode | null => {
+  const view = ctx.get(editorViewCtx);
+  const editorRect = view.dom.getBoundingClientRect();
+  if (editorRect.width <= 0 || editorRect.height <= 0) {
+    return null;
+  }
+
+  const selectionRect = getSelectionAnchorRect(view);
+  if (!selectionRect) {
+    return null;
+  }
+
+  return selectRootNodeByCoords(ctx, {
+    x: editorRect.left + editorRect.width / 2,
+    y: (selectionRect.top + selectionRect.bottom) / 2,
+  });
 };
 
 export class CustomBlockHandle {
@@ -769,7 +842,7 @@ export class CustomBlockHandle {
     }
 
     if (this.#menuOpen) {
-      this.#positionMenu();
+      this.#syncMenuAnchor();
       return;
     }
 
@@ -783,7 +856,7 @@ export class CustomBlockHandle {
     }
 
     if (this.#menuOpen) {
-      this.#positionMenu();
+      this.#syncMenuAnchor();
       return;
     }
 
@@ -893,17 +966,30 @@ export class CustomBlockHandle {
       this.#syncFrame = null;
 
       if (this.#menuOpen) {
-        if (!this.#handle || !this.#trigger) {
-          this.#closeMenu();
-          return;
-        }
-
-        this.#positionMenu();
+        this.#syncMenuAnchor();
         return;
       }
 
       this.#syncActive();
     });
+  };
+
+  #syncMenuAnchor = () => {
+    if (!this.#handle || !this.#trigger) {
+      this.#closeMenu();
+      return;
+    }
+
+    const active = this.#active ?? selectRootNodeBySelection(this.#ctx);
+    if (!active) {
+      this.#closeMenu();
+      return;
+    }
+
+    this.#active = active;
+    this.#syncIndicator(active.node);
+    this.#positionHandle(active);
+    this.#positionMenu();
   };
 
   #syncActive = () => {
@@ -912,21 +998,25 @@ export class CustomBlockHandle {
     }
 
     const handle = this.#handle;
-    if (!handle || handle.dataset.show !== "true") {
+    if (!handle) {
       this.#active = null;
       this.#syncIndicator(null);
       this.#closeMenu();
       return;
     }
 
-    const nextActive = selectRootNodeByCoords(this.#ctx, {
-      x: handle.getBoundingClientRect().right + 32,
-      y:
-        handle.getBoundingClientRect().top +
-        handle.getBoundingClientRect().height / 2,
-    });
+    if (!this.#menuOpen && !this.#view.hasFocus()) {
+      handle.dataset.show = "false";
+      this.#active = null;
+      this.#syncIndicator(null);
+      this.#closeMenu();
+      return;
+    }
+
+    const nextActive = selectRootNodeBySelection(this.#ctx);
 
     if (!nextActive) {
+      handle.dataset.show = "false";
       this.#active = null;
       this.#syncIndicator(null);
       this.#closeMenu();
@@ -939,10 +1029,44 @@ export class CustomBlockHandle {
 
     this.#active = nextActive;
     this.#syncIndicator(nextActive.node);
+    this.#positionHandle(nextActive);
 
     if (this.#menuOpen) {
       this.#positionMenu();
     }
+  };
+
+  #positionHandle = (active: ActiveBlockNode) => {
+    const handle = this.#handle;
+    if (!handle) {
+      return;
+    }
+
+    const rootRect = this.#root.getBoundingClientRect();
+    const activeRect = active.el.getBoundingClientRect();
+    const selectionRect = getSelectionAnchorRect(this.#view);
+    const handleWidth = handle.offsetWidth || 20;
+    const handleHeight = handle.offsetHeight || 20;
+    const anchorTop = selectionRect?.top ?? activeRect.top;
+    const anchorBottom = selectionRect?.bottom ?? activeRect.top + handleHeight;
+    const lineHeight = Math.max(anchorBottom - anchorTop, handleHeight);
+    const left =
+      activeRect.left -
+      rootRect.left +
+      this.#root.scrollLeft -
+      handleWidth -
+      HANDLE_GAP_PX;
+    const top =
+      anchorTop -
+      rootRect.top +
+      this.#root.scrollTop +
+      Math.max((lineHeight - handleHeight) / 2, 0);
+
+    Object.assign(handle.style, {
+      left: `${Math.round(left)}px`,
+      top: `${Math.round(top)}px`,
+    });
+    handle.dataset.show = "true";
   };
 
   #openMenu = () => {

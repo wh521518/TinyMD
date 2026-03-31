@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.0-beat.9 - 2026-03-31
+
+- Moved the block handle activation model from mouse hover to the current editor selection so the active handle follows the caret line or selected block.
+- Repositioned the custom block handle against the current line anchor, preventing it from covering document content while keeping the menu aligned with the active block.
+- Moved slash-menu density overrides into the Milkdown component stylesheet chain so current-line menus and native menus share the same effective styling.
+- Fixed menu-open anchoring so the handle no longer shifts with mouse hover after the current-line menu is activated.
+
 ## 1.0.0-beat.8 - 2026-03-30
 
 - Reworked block handle dragging to use pointer-based reordering, fixing the blocked drag cursor issue inside the editor.

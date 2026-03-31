@@ -1,5 +1,6 @@
 import "@milkdown/crepe/theme/common/style.css";
 import "@milkdown/prose/gapcursor/style/gapcursor.css";
+import "./milkdownMenuOverrides.css";
 import { parserCtx, schemaCtx } from "@milkdown/core";
 import { Crepe } from "@milkdown/crepe";
 import type { ListenerManager } from "@milkdown/kit/plugin/listener";

@@ -1000,6 +1000,7 @@ button {
   align-items: flex-start;
   gap: 8px;
   width: max-content;
+  transform: none;
 }
 
 .milkdown
@@ -1080,38 +1081,6 @@ button {
   fill: currentColor;
 }
 
-.milkdown .custom-block-handle__menu {
-  z-index: 160;
-}
-
-.milkdown .custom-block-handle__menu .menu-groups {
-  max-height: min(420px, calc(100vh - 40px));
-}
-
-.milkdown .custom-block-handle__menu .menu-group li.custom-block-handle__menu-item--danger {
-  color: #b43b3b;
-}
-
-.milkdown
-  .custom-block-handle__menu
-  .menu-group
-  li.custom-block-handle__menu-item--danger
-  svg {
-  color: #b43b3b;
-  fill: #b43b3b;
-}
-
-.milkdown
-  .custom-block-handle__menu
-  .menu-group
-  li.custom-block-handle__menu-item--danger.hover,
-.milkdown
-  .custom-block-handle__menu
-  .menu-group
-  li.custom-block-handle__menu-item--danger.active {
-  background: #fff1f1;
-}
-
 body.custom-block-handle--dragging {
   cursor: grabbing;
   user-select: none;
@@ -1160,49 +1129,4 @@ body.custom-block-handle--dragging {
 .milkdown .milkdown-toolbar .toolbar-item svg {
   width: 18px;
   height: 18px;
-}
-
-.milkdown .milkdown-slash-menu {
-  border-radius: 8px;
-}
-
-.milkdown .milkdown-slash-menu .tab-group {
-  padding: 8px 8px 0;
-}
-
-.milkdown .milkdown-slash-menu .tab-group ul {
-  gap: 6px;
-  padding: 6px 6px 8px;
-}
-
-.milkdown .milkdown-slash-menu .tab-group ul li {
-  padding: 4px 8px;
-  font-size: 12px;
-  line-height: 16px;
-}
-
-.milkdown .milkdown-slash-menu .menu-groups {
-  padding: 0 8px 8px;
-}
-
-.milkdown .milkdown-slash-menu .menu-groups .menu-group h6 {
-  padding: 10px 8px 8px;
-  font-size: 11px;
-  line-height: 16px;
-}
-
-.milkdown .milkdown-slash-menu .menu-groups .menu-group li {
-  min-width: 180px;
-  gap: 10px;
-  padding: 10px 8px;
-}
-
-.milkdown .milkdown-slash-menu .menu-groups .menu-group li svg {
-  width: 18px;
-  height: 18px;
-}
-
-.milkdown .milkdown-slash-menu .menu-groups .menu-group li > span {
-  font-size: 12px;
-  line-height: 16px;
 }
