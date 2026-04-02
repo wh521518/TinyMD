@@ -363,6 +363,11 @@ const getAncestorBlockNode = (
   return null;
 };
 
+const isTableNode = (node: ProseNode | null) => node?.type.name === "table";
+
+const getTableBlockNode = (view: EditorView, $pos: ResolvedPos) =>
+  getAncestorBlockNode(view, $pos, "table");
+
 const getTopLevelBlockNodeAtIndex = (
   view: EditorView,
   index: number,
@@ -432,6 +437,7 @@ const selectRootNodeByCoords = (
     }
 
     let $pos = view.state.doc.resolve(pos);
+    const resolvedPos = $pos;
     let node = view.state.doc.nodeAt(pos);
     let element = view.nodeDOM(pos) as HTMLElement | null;
 
@@ -461,6 +467,11 @@ const selectRootNodeByCoords = (
 
     if (!node || !element) {
       return null;
+    }
+
+    const tableNode = getTableBlockNode(view, resolvedPos);
+    if (tableNode) {
+      return tableNode;
     }
 
     if (node.type.name === "attachment") {
@@ -532,6 +543,13 @@ const getSelectionAnchorRect = (view: EditorView) => {
 
 const selectRootNodeBySelection = (ctx: Ctx): ActiveBlockNode | null => {
   const view = ctx.get(editorViewCtx);
+  const tableNode =
+    getTableBlockNode(view, view.state.selection.$from) ??
+    getTableBlockNode(view, view.state.selection.$to);
+  if (tableNode) {
+    return tableNode;
+  }
+
   const editorRect = view.dom.getBoundingClientRect();
   if (editorRect.width <= 0 || editorRect.height <= 0) {
     return null;
@@ -546,6 +564,23 @@ const selectRootNodeBySelection = (ctx: Ctx): ActiveBlockNode | null => {
     x: editorRect.left + editorRect.width / 2,
     y: (selectionRect.top + selectionRect.bottom) / 2,
   });
+};
+
+const getCurrentTextblockSelectionPos = (view: EditorView) => {
+  const { doc } = view.state;
+
+  for (const pos of getSelectionPositionCandidates(view)) {
+    try {
+      const $pos = doc.resolve(pos);
+      if ($pos.parent.isTextblock) {
+        return pos;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
 };
 
 export class CustomBlockHandle {
@@ -1047,8 +1082,12 @@ export class CustomBlockHandle {
     const selectionRect = getSelectionAnchorRect(this.#view);
     const handleWidth = handle.offsetWidth || 20;
     const handleHeight = handle.offsetHeight || 20;
-    const anchorTop = selectionRect?.top ?? activeRect.top;
-    const anchorBottom = selectionRect?.bottom ?? activeRect.top + handleHeight;
+    const anchorTop = isTableNode(active.node)
+      ? activeRect.top
+      : (selectionRect?.top ?? activeRect.top);
+    const anchorBottom = isTableNode(active.node)
+      ? activeRect.top + handleHeight
+      : (selectionRect?.bottom ?? activeRect.top + handleHeight);
     const lineHeight = Math.max(anchorBottom - anchorTop, handleHeight);
     const left =
       activeRect.left -
@@ -1436,6 +1475,10 @@ export class CustomBlockHandle {
   };
 
   #getStyleSelectionPos = (active: ActiveBlockNode) => {
+    if (isTableNode(active.node)) {
+      return getCurrentTextblockSelectionPos(this.#view);
+    }
+
     if (active.node.isTextblock) {
       return active.$pos.pos + active.node.content.size;
     }

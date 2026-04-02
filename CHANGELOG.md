@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0-beat.10 - 2026-04-02
+
+- Collapsed table-internal block handling into a single table-level handler so one table now uses one shared handle anchored at the table's top-left corner.
+- Kept table formatting actions scoped to the active text cell while table drag and delete operations continue to target the whole table block.
+- Downgraded Vite and the React plugin to Node 18-compatible versions so `npm run dev` and `tauri dev` no longer fail on `crypto.hash`.
+
 ## 1.0.0-beat.9 - 2026-03-31
 
 - Moved the block handle activation model from mouse hover to the current editor selection so the active handle follows the caret line or selected block.
