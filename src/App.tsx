@@ -24,6 +24,10 @@ import {
   publishAttachmentImportState,
   type AttachmentImportState,
 } from "./lib/attachmentImportState";
+import {
+  logTaskListDebug,
+  normalizeTaskListMarkdown,
+} from "./lib/normalizeTaskListMarkdown";
 import type { EditorTab, TabStorageKind } from "./types";
 
 const getFileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
@@ -1554,18 +1558,23 @@ export default function App() {
         await waitForPendingAssetImports(getWorkingDocumentPath(tab));
       }
 
+      const normalizedContent = normalizeTaskListMarkdown(tab.content);
+      logTaskListDebug("app:save", tab.content, normalizedContent, {
+        tabId: tab.id,
+        targetPath,
+      });
       const nextContent = usesTemporaryDocumentStorage(tab)
         ? await invoke<string>("save_temporary_markdown_file", {
             tabId: tab.id,
             path: targetPath,
-            content: tab.content,
+            content: normalizedContent,
           })
-        : tab.content;
+        : normalizedContent;
 
       if (!usesTemporaryDocumentStorage(tab)) {
         await invoke("save_markdown_file", {
           path: targetPath,
-          content: tab.content,
+          content: normalizedContent,
         });
       }
 
@@ -1772,14 +1781,16 @@ export default function App() {
   };
 
   const handleRichEditorChange = (tabId: string, content: string) => {
+    const normalizedContent = normalizeTaskListMarkdown(content);
+    logTaskListDebug("app:rich-change", content, normalizedContent, { tabId });
     startTransition(() => {
       setTabs((current) =>
         current.map((tab) =>
           tab.id === tabId
             ? {
                 ...tab,
-                content,
-                dirty: content !== tab.savedContent,
+                content: normalizedContent,
+                dirty: normalizedContent !== tab.savedContent,
               }
             : tab,
         ),
@@ -1788,6 +1799,7 @@ export default function App() {
   };
 
   const handleSourceEditorChange = (tabId: string, content: string) => {
+    logTaskListDebug("app:source-change", content, content, { tabId });
     setTabs((current) =>
       current.map((tab) =>
         tab.id === tabId
@@ -2187,13 +2199,18 @@ export default function App() {
 
     void invoke<string>("read_markdown_file", { path: targetTab.sourcePath })
       .then((content) => {
+        const normalizedContent = normalizeTaskListMarkdown(content);
+        logTaskListDebug("app:load", content, normalizedContent, {
+          tabId: targetTab.id,
+          sourcePath: targetTab.sourcePath,
+        });
         setTabs((current) =>
           current.map((tab) =>
             tab.id === targetTab.id
               ? {
                   ...tab,
-                  content,
-                  savedContent: content,
+                  content: normalizedContent,
+                  savedContent: normalizedContent,
                   dirty: false,
                   loaded: true,
                 }

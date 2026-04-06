@@ -13,6 +13,10 @@ import { TextSelection } from "prosemirror-state";
 import { editorViewCtx } from "@milkdown/kit/core";
 import { CustomBlockHandle } from "../lib/customBlockHandle";
 import {
+  logTaskListDebug,
+  normalizeTaskListMarkdown,
+} from "../lib/normalizeTaskListMarkdown";
+import {
   attachmentBlockComponent,
   attachmentBlockConfig,
 } from "../lib/milkdownAttachmentBlock";
@@ -70,79 +74,6 @@ const normalizeStandaloneDisplayMath = (text: string) => {
   return `$$\n${body}\n$$`;
 };
 
-const supportedHtmlTagPattern =
-  /<(?:\/)?(?:b|strong|i|em|mark|span|div|p|br)\b[^>]*\/?>/i;
-
-const renderSupportedHtmlFragmentToMarkdown = (fragment: string) => {
-  if (typeof document === "undefined") {
-    return fragment;
-  }
-
-  const template = document.createElement("template");
-  template.innerHTML = fragment;
-
-  const renderNodes = (nodes: Node[]): string =>
-    nodes
-      .map((node) => {
-        if (node.nodeType === Node.TEXT_NODE) {
-          return node.textContent ?? "";
-        }
-
-        if (!(node instanceof HTMLElement)) {
-          return "";
-        }
-
-        const content = renderNodes(Array.from(node.childNodes));
-
-        switch (node.tagName.toLowerCase()) {
-          case "b":
-          case "strong":
-            return content.trim() ? `**${content}**` : content;
-          case "i":
-          case "em":
-            return content.trim() ? `*${content}*` : content;
-          case "mark":
-          case "span":
-            return content;
-          case "br":
-            return "  \n";
-          case "div":
-          case "p":
-            return `\n\n${content.trim()}\n\n`;
-          default:
-            return node.outerHTML;
-        }
-      })
-      .join("");
-
-  return renderNodes(Array.from(template.content.childNodes));
-};
-
-const normalizeSupportedHtmlMarkdown = (text: string) => {
-  if (!supportedHtmlTagPattern.test(text)) {
-    return text;
-  }
-
-  let normalized = text;
-
-  for (let index = 0; index < 4; index += 1) {
-    const next = normalized
-      .replace(/<br\s*\/?>/gi, "  \n")
-      .replace(
-        /<(div|p|b|strong|i|em|mark|span)\b[^>]*>[\s\S]*?<\/\1>/gi,
-        (match) => renderSupportedHtmlFragmentToMarkdown(match),
-      );
-
-    if (next === normalized) {
-      break;
-    }
-
-    normalized = next;
-  }
-
-  return normalized.replace(/\n{3,}/g, "\n\n");
-};
-
 const normalizeMarkdownPaste = (text: string) => {
   const normalized = text.replace(/\r\n?/g, "\n");
   const lines = normalized.split("\n");
@@ -175,7 +106,7 @@ const normalizeMarkdownPaste = (text: string) => {
     result.push(line);
   }
 
-  return normalizeSupportedHtmlMarkdown(result.join("\n"));
+  return normalizeTaskListMarkdown(result.join("\n"));
 };
 
 const hasMarkdownTable = (lines: string[]) => {
@@ -472,7 +403,7 @@ export const MilkdownEditor = forwardRef<
   ref,
 ) {
   const usesMacCustomListView = isMacWebKit();
-  const normalizedInitialMarkdown = normalizeMarkdownPaste(markdown);
+  const normalizedInitialMarkdown = normalizeTaskListMarkdown(markdown);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<Crepe | null>(null);
   const onChangeRef = useRef(onChange);
@@ -538,12 +469,16 @@ export const MilkdownEditor = forwardRef<
   }, [documentPath]);
 
   const emitMarkdown = (value: string) => {
-    if (value === lastMarkdownRef.current) {
+    const normalizedValue = normalizeTaskListMarkdown(value);
+    logTaskListDebug("milkdown:emit", value, normalizedValue, {
+      documentPath: documentPathRef.current,
+    });
+    if (normalizedValue === lastMarkdownRef.current) {
       return;
     }
 
-    lastMarkdownRef.current = value;
-    onChangeRef.current(value);
+    lastMarkdownRef.current = normalizedValue;
+    onChangeRef.current(normalizedValue);
   };
 
   const flushMarkdownFromEditor = (editor: Crepe) => {
@@ -619,6 +554,10 @@ export const MilkdownEditor = forwardRef<
           return;
         }
 
+        logTaskListDebug("milkdown:markdownUpdated", value, normalizeTaskListMarkdown(value), {
+          documentPath: documentPathRef.current,
+        });
+
         if (flushTimerRef.current !== null) {
           window.clearTimeout(flushTimerRef.current);
           flushTimerRef.current = null;
@@ -653,6 +592,7 @@ export const MilkdownEditor = forwardRef<
         customBlockHandle = new CustomBlockHandle(ctx);
 
         let decorationSyncFrame = 0;
+        let syncMacListMetadata = () => {};
         const scheduleDecorationSync = () => {
           if (decorationSyncFrame) {
             window.cancelAnimationFrame(decorationSyncFrame);
@@ -661,10 +601,12 @@ export const MilkdownEditor = forwardRef<
           decorationSyncFrame = window.requestAnimationFrame(() => {
             decorationSyncFrame = 0;
             syncImageElements();
+            syncMacListMetadata();
 
             // ProseMirror may patch the DOM again on the next frame after insertion.
             window.requestAnimationFrame(() => {
               syncImageElements();
+              syncMacListMetadata();
             });
           });
         };
@@ -948,6 +890,29 @@ export const MilkdownEditor = forwardRef<
           }
 
           return getListItemContextAtPos(probePosition.inside);
+        };
+        syncMacListMetadata = () => {
+          if (!usesMacCustomListView) {
+            return;
+          }
+
+          view.dom.querySelectorAll<HTMLLIElement>("li").forEach((listItem) => {
+            const context = getListItemContextFromElement(listItem);
+            if (!context) {
+              delete listItem.dataset.itemType;
+              delete listItem.dataset.checked;
+              return;
+            }
+
+            if (context.item.attrs.checked == null) {
+              delete listItem.dataset.itemType;
+              delete listItem.dataset.checked;
+              return;
+            }
+
+            listItem.dataset.itemType = "task";
+            listItem.dataset.checked = String(Boolean(context.item.attrs.checked));
+          });
         };
         const getTaskListItemFromPoint = (x: number, y: number) => {
           const candidates = Array.from(
@@ -1339,7 +1304,7 @@ export const MilkdownEditor = forwardRef<
   }, [docKey]);
 
   useEffect(() => {
-    lastMarkdownRef.current = normalizeMarkdownPaste(markdown);
+    lastMarkdownRef.current = normalizeTaskListMarkdown(markdown);
   }, [markdown]);
 
   const setRefs = (node: HTMLDivElement | null) => {
