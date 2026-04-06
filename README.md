@@ -19,6 +19,10 @@ A lightweight desktop Markdown editor built with `Tauri + React + TypeScript + M
 - 支持常用快捷键：`Ctrl/Cmd + N`、`Ctrl/Cmd + O`、`Ctrl/Cmd + S` / Supports common shortcuts: `Ctrl/Cmd + N`, `Ctrl/Cmd + O`, `Ctrl/Cmd + S`
 - Markdown 链接使用系统默认浏览器打开 / Open Markdown links in the system default browser
 
+## 架构文档 / Architecture Notes
+
+- 编辑器架构、Milkdown 改造点、mac / Windows 平台适配边界见 [docs/editor-architecture.md](./docs/editor-architecture.md)
+
 ## 开发 / Development
 
 ```bash

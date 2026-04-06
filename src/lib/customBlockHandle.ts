@@ -120,6 +120,21 @@ const H3_ICON = `
   </svg>
 `;
 
+const HANDLE_MENU_ICON = `
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="24"
+    height="24"
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+  >
+    <path
+      fill="currentColor"
+      d="M11 18C11 19.1 10.1 20 9 20C7.9 20 7 19.1 7 18C7 16.9 7.9 16 9 16C10.1 16 11 16.9 11 18ZM9 10C7.9 10 7 10.9 7 12C7 13.1 7.9 14 9 14C10.1 14 11 13.1 11 12C11 10.9 10.1 10 9 10ZM9 4C7.9 4 7 4.9 7 6C7 7.1 7.9 8 9 8C10.1 8 11 7.1 11 6C11 4.9 10.1 4 9 4ZM15 8C16.1 8 17 7.1 17 6C17 4.9 16.1 4 15 4C13.9 4 13 4.9 13 6C13 7.1 13.9 8 15 8ZM15 10C13.9 10 13 10.9 13 12C13 13.1 13.9 14 15 14C16.1 14 17 13.1 17 12C17 10.9 16.1 10 15 10ZM15 16C13.9 16 13 16.9 13 18C13 19.1 13.9 20 15 20C16.1 20 17 19.1 17 18C17 16.9 16.1 16 15 16Z"
+    />
+  </svg>
+`;
+
 const H4_ICON = `
   <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
     <g clip-path="url(#tinymd_menu_h4)">
@@ -225,6 +240,9 @@ const POINTER_DRAG_THRESHOLD_PX = 4;
 const EDGE_AUTO_SCROLL_BUFFER_PX = 40;
 const EDGE_AUTO_SCROLL_STEP_PX = 18;
 const HANDLE_GAP_PX = 10;
+const MAC_CUSTOM_LIST_GUTTER_PX = 44;
+const MAC_CUSTOM_LIST_HANDLE_INSET_PX = 4;
+const MAC_CUSTOM_LIST_ROW_HEIGHT_PX = 32;
 const MENU_OFFSET_PX = 10;
 
 const FORMAT_MENU_GROUPS: readonly FormatMenuGroup[] = [
@@ -364,9 +382,40 @@ const getAncestorBlockNode = (
 };
 
 const isTableNode = (node: ProseNode | null) => node?.type.name === "table";
+const usesMacCustomListView = (root: HTMLElement) =>
+  root.closest(".uses-mac-custom-list-view") !== null;
+const isMacCustomListItemContext = (root: HTMLElement, node: ProseNode) =>
+  usesMacCustomListView(root) && node.type.name === "list_item";
+const getListContainer = (element: HTMLElement) => {
+  const parent = element.parentElement;
+  return parent instanceof HTMLOListElement || parent instanceof HTMLUListElement ? parent : null;
+};
+const getPositioningContainer = (element: HTMLElement, fallback: HTMLElement) =>
+  element.offsetParent instanceof HTMLElement ? element.offsetParent : fallback;
 
 const getTableBlockNode = (view: EditorView, $pos: ResolvedPos) =>
   getAncestorBlockNode(view, $pos, "table");
+
+const getMacCustomListItemBlockNode = (view: EditorView, root: HTMLElement, $pos: ResolvedPos) => {
+  if (!usesMacCustomListView(root)) {
+    return null;
+  }
+
+  return getAncestorBlockNode(view, $pos, "list_item");
+};
+
+const normalizeHandleAnchorNode = (
+  view: EditorView,
+  root: HTMLElement,
+  active: ActiveBlockNode,
+) => {
+  if (!usesMacCustomListView(root) || active.node.type.name === "list_item") {
+    return active;
+  }
+
+  const listItemNode = getAncestorBlockNode(view, active.$pos, "list_item");
+  return listItemNode ?? active;
+};
 
 const getTopLevelBlockNodeAtIndex = (
   view: EditorView,
@@ -424,6 +473,7 @@ const selectRootNodeByCoords = (
   coords: { x: number; y: number },
 ): ActiveBlockNode | null => {
   const view = ctx.get(editorViewCtx);
+  const root = view.dom.parentElement ?? view.dom;
   const filterNodes = getFilterNodes(ctx);
 
   try {
@@ -472,6 +522,11 @@ const selectRootNodeByCoords = (
     const tableNode = getTableBlockNode(view, resolvedPos);
     if (tableNode) {
       return tableNode;
+    }
+
+    const macCustomListItemNode = getMacCustomListItemBlockNode(view, root, $pos);
+    if (macCustomListItemNode) {
+      return macCustomListItemNode;
     }
 
     if (node.type.name === "attachment") {
@@ -541,13 +596,58 @@ const getSelectionAnchorRect = (view: EditorView) => {
   return null;
 };
 
+const getBlockAnchorLineHeight = (element: HTMLElement, fallback: number) => {
+  const styles = window.getComputedStyle(element);
+  const parsedLineHeight = Number.parseFloat(styles.lineHeight);
+  if (Number.isFinite(parsedLineHeight) && parsedLineHeight > 0) {
+    return parsedLineHeight;
+  }
+
+  const parsedFontSize = Number.parseFloat(styles.fontSize);
+  if (Number.isFinite(parsedFontSize) && parsedFontSize > 0) {
+    return parsedFontSize * 1.5;
+  }
+
+  return fallback;
+};
+
+const getActiveLineAnchorTop = (
+  view: EditorView,
+  element: HTMLElement,
+  lineHeight: number,
+) => {
+  const elementRect = element.getBoundingClientRect();
+  const selectionRect = getSelectionAnchorRect(view);
+  if (!selectionRect || lineHeight <= 0) {
+    return elementRect.top;
+  }
+
+  const selectionCenter = (selectionRect.top + selectionRect.bottom) / 2;
+  if (selectionCenter < elementRect.top || selectionCenter > elementRect.bottom) {
+    return elementRect.top;
+  }
+
+  const relativeOffset = Math.max(selectionCenter - elementRect.top, 0);
+  const maxRowIndex = Math.max(Math.floor((elementRect.height - 1) / lineHeight), 0);
+  const rowIndex = Math.min(Math.floor(relativeOffset / lineHeight), maxRowIndex);
+  return elementRect.top + rowIndex * lineHeight;
+};
+
 const selectRootNodeBySelection = (ctx: Ctx): ActiveBlockNode | null => {
   const view = ctx.get(editorViewCtx);
+  const root = view.dom.parentElement ?? view.dom;
   const tableNode =
     getTableBlockNode(view, view.state.selection.$from) ??
     getTableBlockNode(view, view.state.selection.$to);
   if (tableNode) {
     return tableNode;
+  }
+
+  const macCustomListItemNode =
+    getMacCustomListItemBlockNode(view, root, view.state.selection.$from) ??
+    getMacCustomListItemBlockNode(view, root, view.state.selection.$to);
+  if (macCustomListItemNode) {
+    return macCustomListItemNode;
   }
 
   const editorRect = view.dom.getBoundingClientRect();
@@ -583,6 +683,13 @@ const getCurrentTextblockSelectionPos = (view: EditorView) => {
   return null;
 };
 
+const ENABLE_LIST_DEBUG = import.meta.env.DEV;
+const QUIET_LIST_DEBUG_REASONS = new Set([
+  "position",
+  "sync-show",
+  "sync-hide-no-focus",
+]);
+
 export class CustomBlockHandle {
   readonly #ctx: Ctx;
   readonly #view: EditorView;
@@ -600,6 +707,7 @@ export class CustomBlockHandle {
   #syncFrame: number | null = null;
   #pointerDrag: PointerDragState | null = null;
   #suppressTriggerClick = false;
+  #lastDebugSnapshot = "";
 
   constructor(ctx: Ctx) {
     this.#ctx = ctx;
@@ -629,6 +737,7 @@ export class CustomBlockHandle {
     document.addEventListener("scroll", this.#handleDocumentScroll, true);
     window.addEventListener("resize", this.#handleWindowResize);
     this.#view.dom.addEventListener("focus", this.#queueSyncFromEvent, true);
+    this.#view.dom.addEventListener("blur", this.#queueSyncFromEvent, true);
     this.#view.dom.addEventListener("pointerup", this.#queueSyncFromEvent, true);
     this.#view.dom.addEventListener("keyup", this.#queueSyncFromEvent, true);
 
@@ -641,6 +750,7 @@ export class CustomBlockHandle {
       subtree: true,
     });
 
+    this.#debugListState("init");
     this.update();
   }
 
@@ -663,6 +773,7 @@ export class CustomBlockHandle {
 
     this.#teardownPointerDrag();
     this.#view.dom.removeEventListener("focus", this.#queueSyncFromEvent, true);
+    this.#view.dom.removeEventListener("blur", this.#queueSyncFromEvent, true);
     this.#view.dom.removeEventListener("pointerup", this.#queueSyncFromEvent, true);
     this.#view.dom.removeEventListener("keyup", this.#queueSyncFromEvent, true);
     document.removeEventListener(
@@ -867,6 +978,7 @@ export class CustomBlockHandle {
       return;
     }
 
+    this.#debugListState("selectionchange");
     this.#queueSync();
   };
 
@@ -903,42 +1015,31 @@ export class CustomBlockHandle {
   };
 
   #bindHandle = () => {
-    const nextHandle =
-      this.#root.querySelector<HTMLDivElement>(".milkdown-block-handle") ?? null;
-
-    if (!nextHandle) {
-      this.#unbindHandle();
-      return;
-    }
-
-    if (this.#handle === nextHandle) {
+    if (this.#handle?.isConnected && this.#trigger?.isConnected) {
       return;
     }
 
     this.#unbindHandle();
-    this.#handle = nextHandle;
-    this.#handle.classList.add("custom-block-handle");
-    this.#handle.dataset.pointerDragging = "false";
+    const handle = document.createElement("div");
+    handle.className = "tinymd-block-handle custom-block-handle";
+    handle.dataset.show = "false";
+    handle.dataset.menuOpen = "false";
+    handle.dataset.pointerDragging = "false";
 
-    const operationItems = Array.from(
-      this.#handle.querySelectorAll<HTMLDivElement>(".operation-item"),
-    );
+    const trigger = document.createElement("div");
+    trigger.className = "operation-item custom-block-handle__trigger";
+    trigger.draggable = false;
+    trigger.innerHTML = HANDLE_MENU_ICON;
 
-    const addButton = operationItems[0] ?? null;
-    const trigger = operationItems[1] ?? null;
+    handle.append(trigger);
 
-    if (addButton) {
-      addButton.classList.add("custom-block-handle__add");
-    }
-
-    if (!trigger) {
-      return;
-    }
-
+    this.#handle = handle;
     this.#trigger = trigger;
     this.#trigger.classList.add("custom-block-handle__trigger");
     this.#trigger.draggable = false;
     this.#trigger.prepend(this.#levelIndicator);
+
+    this.#root.append(this.#handle);
 
     if (!this.#menu.isConnected) {
       this.#root.append(this.#menu);
@@ -947,16 +1048,6 @@ export class CustomBlockHandle {
     this.#trigger.addEventListener("pointerdown", this.#handleTriggerPointerDown);
     this.#trigger.addEventListener("click", this.#handleTriggerClick);
     this.#trigger.addEventListener("contextmenu", this.#handleTriggerContextMenu);
-
-    this.#observer = new MutationObserver(() => {
-      this.#queueSync();
-    });
-    this.#observer.observe(this.#handle, {
-      attributes: true,
-      attributeFilter: ["style", "data-show"],
-      childList: true,
-      subtree: true,
-    });
   };
 
   #unbindHandle = () => {
@@ -975,15 +1066,10 @@ export class CustomBlockHandle {
     }
 
     if (this.#handle) {
-      this.#handle.classList.remove("custom-block-handle");
       this.#handle.dataset.menuOpen = "false";
       this.#handle.dataset.pointerDragging = "false";
+      this.#handle.remove();
     }
-
-    const addButton = this.#handle?.querySelector<HTMLDivElement>(
-      ".custom-block-handle__add",
-    );
-    addButton?.classList.remove("custom-block-handle__add");
 
     this.#levelIndicator.remove();
     this.#menu.remove();
@@ -1011,12 +1097,17 @@ export class CustomBlockHandle {
 
   #syncMenuAnchor = () => {
     if (!this.#handle || !this.#trigger) {
+      this.#debugListState("menu-anchor-missing");
       this.#closeMenu();
       return;
     }
 
-    const active = this.#active ?? selectRootNodeBySelection(this.#ctx);
+    const activeCandidate = this.#active ?? selectRootNodeBySelection(this.#ctx);
+    const active = activeCandidate
+      ? normalizeHandleAnchorNode(this.#view, this.#root, activeCandidate)
+      : null;
     if (!active) {
+      this.#debugListState("menu-anchor-no-active");
       this.#closeMenu();
       return;
     }
@@ -1024,6 +1115,7 @@ export class CustomBlockHandle {
     this.#active = active;
     this.#syncIndicator(active.node);
     this.#positionHandle(active);
+    this.#debugListState("menu-anchor", active);
     this.#positionMenu();
   };
 
@@ -1036,6 +1128,7 @@ export class CustomBlockHandle {
     if (!handle) {
       this.#active = null;
       this.#syncIndicator(null);
+      this.#debugListState("sync-no-handle");
       this.#closeMenu();
       return;
     }
@@ -1044,16 +1137,24 @@ export class CustomBlockHandle {
       handle.dataset.show = "false";
       this.#active = null;
       this.#syncIndicator(null);
+      this.#debugListState("sync-hide-no-focus");
       this.#closeMenu();
       return;
     }
 
-    const nextActive = selectRootNodeBySelection(this.#ctx);
+    const selectionActive = selectRootNodeBySelection(this.#ctx);
+    const nextActiveCandidate = this.#menuOpen
+      ? this.#active ?? selectionActive
+      : selectionActive;
+    const nextActive = nextActiveCandidate
+      ? normalizeHandleAnchorNode(this.#view, this.#root, nextActiveCandidate)
+      : null;
 
     if (!nextActive) {
       handle.dataset.show = "false";
       this.#active = null;
       this.#syncIndicator(null);
+      this.#debugListState("sync-hide-no-active");
       this.#closeMenu();
       return;
     }
@@ -1064,7 +1165,9 @@ export class CustomBlockHandle {
 
     this.#active = nextActive;
     this.#syncIndicator(nextActive.node);
+
     this.#positionHandle(nextActive);
+    this.#debugListState("sync-show", nextActive);
 
     if (this.#menuOpen) {
       this.#positionMenu();
@@ -1077,28 +1180,41 @@ export class CustomBlockHandle {
       return;
     }
 
-    const rootRect = this.#root.getBoundingClientRect();
+    const positioningContainer = getPositioningContainer(handle, this.#root);
+    const positioningRect = positioningContainer.getBoundingClientRect();
     const activeRect = active.el.getBoundingClientRect();
-    const selectionRect = getSelectionAnchorRect(this.#view);
     const handleWidth = handle.offsetWidth || 20;
     const handleHeight = handle.offsetHeight || 20;
+    const macCustomListItem = isMacCustomListItemContext(this.#root, active.node);
+    const lineHeight = Math.max(
+      isTableNode(active.node)
+        ? handleHeight
+        : macCustomListItem
+          ? MAC_CUSTOM_LIST_ROW_HEIGHT_PX
+          : getBlockAnchorLineHeight(active.el, handleHeight),
+      handleHeight,
+    );
     const anchorTop = isTableNode(active.node)
       ? activeRect.top
-      : (selectionRect?.top ?? activeRect.top);
-    const anchorBottom = isTableNode(active.node)
-      ? activeRect.top + handleHeight
-      : (selectionRect?.bottom ?? activeRect.top + handleHeight);
-    const lineHeight = Math.max(anchorBottom - anchorTop, handleHeight);
-    const left =
+      : getActiveLineAnchorTop(this.#view, active.el, lineHeight);
+    const defaultLeft =
       activeRect.left -
-      rootRect.left +
-      this.#root.scrollLeft -
+      positioningRect.left +
+      positioningContainer.scrollLeft -
       handleWidth -
       HANDLE_GAP_PX;
+    const macCustomListLeft =
+      activeRect.left -
+      positioningRect.left +
+      positioningContainer.scrollLeft -
+      MAC_CUSTOM_LIST_GUTTER_PX -
+      handleWidth +
+      MAC_CUSTOM_LIST_HANDLE_INSET_PX;
+    const left = macCustomListItem ? macCustomListLeft : defaultLeft;
     const top =
       anchorTop -
-      rootRect.top +
-      this.#root.scrollTop +
+      positioningRect.top +
+      positioningContainer.scrollTop +
       Math.max((lineHeight - handleHeight) / 2, 0);
 
     Object.assign(handle.style, {
@@ -1106,6 +1222,85 @@ export class CustomBlockHandle {
       top: `${Math.round(top)}px`,
     });
     handle.dataset.show = "true";
+    this.#debugListState("position", active);
+  };
+
+  #debugListState = (reason: string, candidate: ActiveBlockNode | null = this.#active) => {
+    if (!ENABLE_LIST_DEBUG) {
+      return;
+    }
+
+    if (QUIET_LIST_DEBUG_REASONS.has(reason)) {
+      return;
+    }
+
+    const selectionPos = getCurrentTextblockSelectionPos(this.#view);
+    const resolvedSelection =
+      typeof selectionPos === "number"
+        ? (() => {
+            try {
+              return this.#view.state.doc.resolve(selectionPos);
+            } catch {
+              return null;
+            }
+          })()
+        : null;
+    const selectionListItem = resolvedSelection
+      ? getAncestorBlockNode(this.#view, resolvedSelection, "list_item")
+      : null;
+    const active = candidate ?? selectionListItem;
+    const handle = this.#handle;
+    const activeElement = active?.el ?? null;
+    const listContainer =
+      activeElement && active?.node.type.name === "list_item" ? getListContainer(activeElement) : null;
+    const handleRect = handle?.getBoundingClientRect();
+    const activeRect = activeElement?.getBoundingClientRect();
+    const markerStyles =
+      activeElement instanceof HTMLLIElement
+        ? window.getComputedStyle(activeElement, "::marker")
+        : null;
+    const payload = {
+      reason,
+      menuOpen: this.#menuOpen,
+      activePos: active?.$pos.pos ?? null,
+      activeNodeType: active?.node.type.name ?? null,
+      checked: active?.node.attrs.checked ?? null,
+      itemType: activeElement?.dataset.itemType ?? null,
+      text: active?.node.textContent ?? null,
+      isEmpty: active ? active.node.textContent.length === 0 : null,
+      handleShow: handle?.dataset.show ?? null,
+      handleLeft: handle?.style.left ?? null,
+      handleTop: handle?.style.top ?? null,
+      handleRect: handleRect
+        ? {
+            left: Math.round(handleRect.left),
+            top: Math.round(handleRect.top),
+            width: Math.round(handleRect.width),
+            height: Math.round(handleRect.height),
+          }
+        : null,
+      activeRect: activeRect
+        ? {
+            left: Math.round(activeRect.left),
+            top: Math.round(activeRect.top),
+            width: Math.round(activeRect.width),
+            height: Math.round(activeRect.height),
+          }
+        : null,
+      listTag: listContainer?.tagName ?? null,
+      listPaddingInlineStart: listContainer
+        ? window.getComputedStyle(listContainer).paddingInlineStart
+        : null,
+      markerColor: markerStyles?.color ?? null,
+      markerContent: markerStyles?.content ?? null,
+    };
+    const snapshot = JSON.stringify(payload);
+    if (snapshot === this.#lastDebugSnapshot) {
+      return;
+    }
+
+    this.#lastDebugSnapshot = snapshot;
+    console.info("[tinymd:list-debug]", payload);
   };
 
   #openMenu = () => {

@@ -70,6 +70,79 @@ const normalizeStandaloneDisplayMath = (text: string) => {
   return `$$\n${body}\n$$`;
 };
 
+const supportedHtmlTagPattern =
+  /<(?:\/)?(?:b|strong|i|em|mark|span|div|p|br)\b[^>]*\/?>/i;
+
+const renderSupportedHtmlFragmentToMarkdown = (fragment: string) => {
+  if (typeof document === "undefined") {
+    return fragment;
+  }
+
+  const template = document.createElement("template");
+  template.innerHTML = fragment;
+
+  const renderNodes = (nodes: Node[]): string =>
+    nodes
+      .map((node) => {
+        if (node.nodeType === Node.TEXT_NODE) {
+          return node.textContent ?? "";
+        }
+
+        if (!(node instanceof HTMLElement)) {
+          return "";
+        }
+
+        const content = renderNodes(Array.from(node.childNodes));
+
+        switch (node.tagName.toLowerCase()) {
+          case "b":
+          case "strong":
+            return content.trim() ? `**${content}**` : content;
+          case "i":
+          case "em":
+            return content.trim() ? `*${content}*` : content;
+          case "mark":
+          case "span":
+            return content;
+          case "br":
+            return "  \n";
+          case "div":
+          case "p":
+            return `\n\n${content.trim()}\n\n`;
+          default:
+            return node.outerHTML;
+        }
+      })
+      .join("");
+
+  return renderNodes(Array.from(template.content.childNodes));
+};
+
+const normalizeSupportedHtmlMarkdown = (text: string) => {
+  if (!supportedHtmlTagPattern.test(text)) {
+    return text;
+  }
+
+  let normalized = text;
+
+  for (let index = 0; index < 4; index += 1) {
+    const next = normalized
+      .replace(/<br\s*\/?>/gi, "  \n")
+      .replace(
+        /<(div|p|b|strong|i|em|mark|span)\b[^>]*>[\s\S]*?<\/\1>/gi,
+        (match) => renderSupportedHtmlFragmentToMarkdown(match),
+      );
+
+    if (next === normalized) {
+      break;
+    }
+
+    normalized = next;
+  }
+
+  return normalized.replace(/\n{3,}/g, "\n\n");
+};
+
 const normalizeMarkdownPaste = (text: string) => {
   const normalized = text.replace(/\r\n?/g, "\n");
   const lines = normalized.split("\n");
@@ -102,7 +175,7 @@ const normalizeMarkdownPaste = (text: string) => {
     result.push(line);
   }
 
-  return result.join("\n");
+  return normalizeSupportedHtmlMarkdown(result.join("\n"));
 };
 
 const hasMarkdownTable = (lines: string[]) => {
@@ -360,6 +433,23 @@ const lightCodeMirrorTheme = CodeMirrorView.theme(
   { dark: false }
 );
 
+const isMacWebKit = () => {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const userAgentData = (
+    navigator as Navigator & {
+      userAgentData?: {
+        platform?: string;
+      };
+    }
+  ).userAgentData;
+  const platform =
+    typeof userAgentData?.platform === "string" ? userAgentData.platform : navigator.platform;
+  return /mac/i.test(platform);
+};
+
 export const MilkdownEditor = forwardRef<
   HTMLDivElement,
   MilkdownEditorProps & { docKey: string }
@@ -381,6 +471,8 @@ export const MilkdownEditor = forwardRef<
   },
   ref,
 ) {
+  const usesMacCustomListView = isMacWebKit();
+  const normalizedInitialMarkdown = normalizeMarkdownPaste(markdown);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<Crepe | null>(null);
   const onChangeRef = useRef(onChange);
@@ -397,7 +489,7 @@ export const MilkdownEditor = forwardRef<
   const imageSourceCacheRef = useRef(new Map<string, string>());
   const pendingImageLoadsRef = useRef(new Map<string, Promise<string>>());
   const isComposingRef = useRef(false);
-  const lastMarkdownRef = useRef(markdown);
+  const lastMarkdownRef = useRef(normalizedInitialMarkdown);
   const flushTimerRef = useRef<number | null>(null);
   const isEditorReadyRef = useRef(false);
 
@@ -473,10 +565,26 @@ export const MilkdownEditor = forwardRef<
 
     isEditorReadyRef.current = false;
     rootRef.current.innerHTML = "";
+    // macOS Tauri runs on WKWebView/WebKit. We keep Windows and other platforms
+    // on the stock Crepe list-item path, while macOS uses a custom list gutter
+    // so list markers do not depend on native WebKit rendering.
+    const disableListItemFeature = usesMacCustomListView;
+    if (import.meta.env.DEV) {
+      console.info("[tinymd:list-debug] editor-init", {
+        usesMacCustomListView,
+        userAgent:
+          typeof navigator === "undefined" ? "unknown" : navigator.userAgent,
+      });
+    }
 
     const editor = new Crepe({
       root: rootRef.current,
-      defaultValue: markdown,
+      defaultValue: normalizedInitialMarkdown,
+      features: disableListItemFeature
+        ? {
+            [Crepe.Feature.ListItem]: false,
+          }
+        : undefined,
       featureConfigs: {
         [Crepe.Feature.Placeholder]: {
           text: "输入 / 唤起更多",
@@ -806,6 +914,202 @@ export const MilkdownEditor = forwardRef<
             flushMarkdownFromEditor(editor);
           }, 0);
         };
+        const macListGutterPx = 44;
+        const getListItemContextAtPos = (pos: number) => {
+          try {
+            const $pos = view.state.doc.resolve(pos);
+
+            for (let depth = $pos.depth; depth > 0; depth -= 1) {
+              const node = $pos.node(depth);
+              if (node.type.name !== "list_item") {
+                continue;
+              }
+
+              return {
+                item: node,
+                itemPos: $pos.before(depth),
+              };
+            }
+          } catch {
+            return null;
+          }
+
+          return null;
+        };
+        const getListItemContextFromElement = (element: HTMLElement) => {
+          const rect = element.getBoundingClientRect();
+          const probePosition = view.posAtCoords({
+            left: rect.left + Math.min(12, Math.max(rect.width - 1, 1)),
+            top: rect.top + Math.min(rect.height / 2, 16),
+          });
+
+          if (typeof probePosition?.inside !== "number") {
+            return null;
+          }
+
+          return getListItemContextAtPos(probePosition.inside);
+        };
+        const getTaskListItemFromPoint = (x: number, y: number) => {
+          const candidates = Array.from(
+            view.dom.querySelectorAll<HTMLElement>('li[data-item-type="task"]'),
+          );
+
+          for (const listItem of candidates) {
+            const rect = listItem.getBoundingClientRect();
+            const markerHitMin = rect.left - macListGutterPx;
+            const markerHitMax = rect.left + 6;
+            const isWithinRow = y >= rect.top && y <= rect.bottom;
+            const isWithinMarker = x >= markerHitMin && x <= markerHitMax;
+
+            if (isWithinRow && isWithinMarker) {
+              return listItem;
+            }
+          }
+
+          return null;
+        };
+        const handleMacTaskListPointerDown = (event: PointerEvent) => {
+          if (!usesMacCustomListView) {
+            return;
+          }
+
+          const target = event.target;
+          if (!(target instanceof Element)) {
+            return;
+          }
+
+          if (!view.dom.contains(target)) {
+            return;
+          }
+
+          const listItem = getTaskListItemFromPoint(event.clientX, event.clientY);
+          if (!listItem) {
+            return;
+          }
+
+          const context = getListItemContextFromElement(listItem);
+          if (!context || context.item.attrs.checked == null) {
+            return;
+          }
+
+          event.preventDefault();
+          event.stopPropagation();
+
+          view.dispatch(
+            view.state.tr.setNodeAttribute(
+              context.itemPos,
+              "checked",
+              !Boolean(context.item.attrs.checked),
+            ),
+          );
+
+          if (!view.hasFocus()) {
+            view.focus();
+          }
+        };
+        let orderedListCleanupTimer: number | null = null;
+        const getOrderedListContext = (currentView: typeof view) => {
+          const { $from } = currentView.state.selection;
+
+          for (let depth = $from.depth; depth > 0; depth -= 1) {
+            const node = $from.node(depth);
+            if (node.type.name !== "list_item") {
+              continue;
+            }
+
+            if (depth < 1) {
+              return null;
+            }
+
+            const parent = $from.node(depth - 1);
+            if (parent.type.name !== "ordered_list") {
+              return null;
+            }
+
+            return {
+              index: $from.index(depth - 1),
+              item: node,
+              itemPos: $from.before(depth),
+            };
+          }
+
+          return null;
+        };
+        const cleanupMacOrderedListAutoLabel = (currentView: typeof view) => {
+          if (!usesMacCustomListView) {
+            return;
+          }
+
+          const context = getOrderedListContext(currentView);
+          if (!context) {
+            return;
+          }
+
+          const { item, itemPos, index } = context;
+          const firstChild = item.firstChild;
+          if (!firstChild?.isTextblock) {
+            return;
+          }
+
+          const unwantedLabel = `${index + 2}.`;
+          const itemText = item.textContent.trim();
+          const firstChildText = firstChild.textContent.trim();
+          if (itemText !== unwantedLabel || firstChildText !== unwantedLabel) {
+            return;
+          }
+
+          const paragraphPos = itemPos + 1;
+          const textFrom = paragraphPos + 1;
+          const textTo = paragraphPos + firstChild.content.size + 1;
+          if (textTo <= textFrom) {
+            return;
+          }
+
+          currentView.dispatch(currentView.state.tr.delete(textFrom, textTo));
+        };
+        const scheduleMacOrderedListCleanup = (currentView: typeof view) => {
+          if (!usesMacCustomListView) {
+            return;
+          }
+
+          if (orderedListCleanupTimer !== null) {
+            window.clearTimeout(orderedListCleanupTimer);
+          }
+
+          orderedListCleanupTimer = window.setTimeout(() => {
+            orderedListCleanupTimer = null;
+            cleanupMacOrderedListAutoLabel(currentView);
+            window.requestAnimationFrame(() => {
+              cleanupMacOrderedListAutoLabel(currentView);
+            });
+          }, 0);
+        };
+        const previousHandleKeyDown = view.props.handleKeyDown;
+        const handleEditorKeyDown = (currentView: typeof view, event: KeyboardEvent) => {
+          const orderedListContext =
+            event.key === "Enter" ? getOrderedListContext(currentView) : null;
+          // Route IME confirmation Enter through ProseMirror's keydown pipeline.
+          // Returning true here lets ProseMirror prevent default and avoids
+          // duplicate Enter handling from mixed DOM/PM event paths.
+          const isImeConfirmEnter =
+            event.key === "Enter" &&
+            (event.isComposing || isComposingRef.current || event.keyCode === 229);
+          if (isImeConfirmEnter) {
+            if (orderedListContext) {
+              scheduleMacOrderedListCleanup(currentView);
+            }
+            return true;
+          }
+
+          if (orderedListContext) {
+            scheduleMacOrderedListCleanup(currentView);
+          }
+
+          return previousHandleKeyDown ? previousHandleKeyDown(currentView, event) : false;
+        };
+        view.setProps({
+          handleKeyDown: handleEditorKeyDown,
+        });
         const handleLinkClick = (event: MouseEvent) => {
           const target = event.target;
           if (!(target instanceof Element)) {
@@ -940,6 +1244,7 @@ export const MilkdownEditor = forwardRef<
 
         view.dom.addEventListener("compositionstart", handleCompositionStart);
         view.dom.addEventListener("compositionend", handleCompositionEnd);
+        view.dom.addEventListener("pointerdown", handleMacTaskListPointerDown, true);
         view.dom.addEventListener("click", handleLinkClick);
         view.dom.addEventListener("paste", handlePaste, true);
         view.dom.addEventListener("dragover", handleDragOver);
@@ -960,8 +1265,16 @@ export const MilkdownEditor = forwardRef<
             window.cancelAnimationFrame(decorationSyncFrame);
             decorationSyncFrame = 0;
           }
+          if (orderedListCleanupTimer !== null) {
+            window.clearTimeout(orderedListCleanupTimer);
+            orderedListCleanupTimer = null;
+          }
           view.dom.removeEventListener("compositionstart", handleCompositionStart);
           view.dom.removeEventListener("compositionend", handleCompositionEnd);
+          view.dom.removeEventListener("pointerdown", handleMacTaskListPointerDown, true);
+          view.setProps({
+            handleKeyDown: previousHandleKeyDown,
+          });
           view.dom.removeEventListener("click", handleLinkClick);
           view.dom.removeEventListener("paste", handlePaste, true);
           view.dom.removeEventListener("dragover", handleDragOver);
@@ -978,8 +1291,16 @@ export const MilkdownEditor = forwardRef<
             window.cancelAnimationFrame(decorationSyncFrame);
             decorationSyncFrame = 0;
           }
+          if (orderedListCleanupTimer !== null) {
+            window.clearTimeout(orderedListCleanupTimer);
+            orderedListCleanupTimer = null;
+          }
           view.dom.removeEventListener("compositionstart", handleCompositionStart);
           view.dom.removeEventListener("compositionend", handleCompositionEnd);
+          view.dom.removeEventListener("pointerdown", handleMacTaskListPointerDown, true);
+          view.setProps({
+            handleKeyDown: previousHandleKeyDown,
+          });
           view.dom.removeEventListener("click", handleLinkClick);
           view.dom.removeEventListener("paste", handlePaste, true);
           view.dom.removeEventListener("dragover", handleDragOver);
@@ -1018,7 +1339,7 @@ export const MilkdownEditor = forwardRef<
   }, [docKey]);
 
   useEffect(() => {
-    lastMarkdownRef.current = markdown;
+    lastMarkdownRef.current = normalizeMarkdownPaste(markdown);
   }, [markdown]);
 
   const setRefs = (node: HTMLDivElement | null) => {
@@ -1033,7 +1354,15 @@ export const MilkdownEditor = forwardRef<
   };
 
   return (
-    <div className={`editor-shell ${markdown.trim() ? "" : "is-empty"}`.trim()}>
+    <div
+      className={[
+        "editor-shell",
+        markdown.trim() ? "" : "is-empty",
+        usesMacCustomListView ? "uses-mac-custom-list-view" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
       <div className="editor-host" ref={setRefs} />
     </div>
   );

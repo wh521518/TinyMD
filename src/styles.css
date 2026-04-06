@@ -690,6 +690,108 @@ button {
   color: var(--text);
 }
 
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ul {
+  margin-block: 0;
+  padding-inline-start: 44px;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol {
+  counter-reset: tinymd-ordered-list;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol > li,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ul > li,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"] {
+  position: relative;
+  list-style: none;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol > li::before,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ul > li::before,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"]::before {
+  position: absolute;
+  top: 0;
+  left: -44px;
+  width: 36px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  line-height: 24px;
+  text-align: right;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol > li:not([data-item-type="task"]) {
+  counter-increment: tinymd-ordered-list;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol > li:not([data-item-type="task"])::before {
+  content: counter(tinymd-ordered-list) ".";
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ul > li:not([data-item-type="task"])::before {
+  content: "•";
+  justify-content: center;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"]::before {
+  content: "";
+  top: 6px;
+  left: -36px;
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--text-muted);
+  border-radius: 4px;
+  background: transparent;
+  pointer-events: none;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"][data-checked="true"]::before {
+  border-color: var(--text);
+  background: var(--text);
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"][data-checked="true"]::after {
+  content: "";
+  position: absolute;
+  top: 10px;
+  left: -30px;
+  width: 5px;
+  height: 9px;
+  border-right: 2px solid var(--panel);
+  border-bottom: 2px solid var(--panel);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol > li > :first-child,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ul > li > :first-child,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"] > :first-child {
+  margin-top: 0;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol > li > :last-child,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ul > li > :last-child,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"] > :last-child {
+  margin-bottom: 0;
+}
+
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol > li > ol,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ol > li > ul,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ul > li > ol,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror ul > li > ul,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"] > ol,
+.editor-shell.uses-mac-custom-list-view .milkdown .ProseMirror li[data-item-type="task"] > ul {
+  margin-top: 4px;
+}
+
 .milkdown .ProseMirror blockquote {
   border-left: 2px solid var(--border-strong);
   margin-left: 0;
@@ -983,16 +1085,16 @@ button {
 }
 
 .milkdown .milkdown-block-handle {
-  transform: translate(8px, 4px);
-  transition: opacity 0.18s ease;
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 
-.milkdown .milkdown-block-handle.custom-block-handle[data-show="false"] {
+.milkdown .tinymd-block-handle.custom-block-handle[data-show="false"] {
   opacity: 0;
   pointer-events: none;
 }
 
-.milkdown .milkdown-block-handle.custom-block-handle {
+.milkdown .tinymd-block-handle.custom-block-handle {
   position: absolute;
   z-index: 20;
   display: flex;
@@ -1001,16 +1103,17 @@ button {
   gap: 8px;
   width: max-content;
   transform: none;
+  transition: opacity 0.18s ease;
 }
 
 .milkdown
-  .milkdown-block-handle.custom-block-handle
+  .tinymd-block-handle.custom-block-handle
   .operation-item.custom-block-handle__add {
   display: none !important;
 }
 
 .milkdown
-  .milkdown-block-handle.custom-block-handle
+  .tinymd-block-handle.custom-block-handle
   .operation-item.custom-block-handle__trigger {
   display: inline-flex;
   position: relative;
@@ -1030,34 +1133,45 @@ button {
 }
 
 .milkdown
-  .milkdown-block-handle.custom-block-handle[data-menu-open="true"]
+  .tinymd-block-handle.custom-block-handle
+  .operation-item.custom-block-handle__trigger::after {
+  content: "";
+  position: absolute;
+  top: -6px;
+  right: -16px;
+  bottom: -6px;
+  left: -6px;
+}
+
+.milkdown
+  .tinymd-block-handle.custom-block-handle[data-menu-open="true"]
   .operation-item.custom-block-handle__trigger,
 .milkdown
-  .milkdown-block-handle.custom-block-handle
+  .tinymd-block-handle.custom-block-handle
   .operation-item.custom-block-handle__trigger:hover {
   background: var(--panel-2);
   color: var(--text);
 }
 
 .milkdown
-  .milkdown-block-handle.custom-block-handle
+  .tinymd-block-handle.custom-block-handle
   .operation-item.custom-block-handle__trigger:active {
   cursor: grabbing;
 }
 
-.milkdown .milkdown-block-handle.custom-block-handle[data-pointer-dragging="true"] {
+.milkdown .tinymd-block-handle.custom-block-handle[data-pointer-dragging="true"] {
   opacity: 0;
   pointer-events: none;
 }
 
 .milkdown
-  .milkdown-block-handle.custom-block-handle
+  .tinymd-block-handle.custom-block-handle
   .operation-item.custom-block-handle__trigger:focus-visible {
   outline: 1px solid var(--border-strong);
   outline-offset: 0;
 }
 
-.milkdown .milkdown-block-handle.custom-block-handle .custom-block-handle__level {
+.milkdown .tinymd-block-handle.custom-block-handle .custom-block-handle__level {
   position: absolute;
   top: 50%;
   right: calc(100% + 4px);
@@ -1073,7 +1187,7 @@ button {
 }
 
 .milkdown
-  .milkdown-block-handle.custom-block-handle
+  .tinymd-block-handle.custom-block-handle
   .operation-item.custom-block-handle__trigger
   svg {
   width: 12px;

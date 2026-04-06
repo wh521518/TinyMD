@@ -21,7 +21,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, DragDropEvent, Emitter, Manager, State, WebviewEvent, WindowEvent,
+    AppHandle, DragDropEvent, Emitter, Manager, RunEvent, State, Url, WebviewEvent, WindowEvent,
 };
 
 const STATE_DIR_NAME: &str = "editor-state";
@@ -232,6 +232,12 @@ struct AppLifecycleState {
     next_upload_id: AtomicU64,
 }
 
+#[derive(Default)]
+struct LaunchRequestState {
+    pending_markdown_files: Mutex<Vec<String>>,
+    launch_requests_drained: AtomicBool,
+}
+
 fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -251,6 +257,42 @@ fn restore_main_window(app: &AppHandle) {
     }
 }
 
+fn normalize_and_collect_unique_paths<I>(paths: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut unique_paths = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            unique_paths.push(path);
+        }
+    }
+
+    unique_paths
+}
+
+fn resolve_path_from_input(value: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let raw = value.trim().trim_matches('"');
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut path = match Url::parse(raw) {
+        Ok(url) if url.scheme() == "file" => url.to_file_path().ok()?,
+        Ok(_) => return None,
+        Err(_) => PathBuf::from(raw),
+    };
+
+    if path.is_relative() {
+        if let Some(base_dir) = cwd {
+            path = base_dir.join(path);
+        }
+    }
+
+    Some(path)
+}
+
 fn collect_markdown_files<I, S>(args: I, cwd: Option<&Path>) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -260,12 +302,11 @@ where
     let mut seen = HashSet::new();
 
     for arg in args {
-        let mut path = PathBuf::from(arg.into());
-        if path.is_relative() {
-            if let Some(base_dir) = cwd {
-                path = base_dir.join(path);
-            }
-        }
+        let raw = arg.into();
+        let raw = raw.to_string_lossy();
+        let Some(path) = resolve_path_from_input(&raw, cwd) else {
+            continue;
+        };
 
         if !path.is_file() || !is_markdown(&path) {
             continue;
@@ -278,6 +319,55 @@ where
     }
 
     files
+}
+
+fn collect_markdown_files_from_urls(urls: &[Url]) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+
+    for url in urls {
+        if url.scheme() != "file" {
+            continue;
+        }
+
+        let Ok(path) = url.to_file_path() else {
+            continue;
+        };
+
+        if !path.is_file() || !is_markdown(&path) {
+            continue;
+        }
+
+        let normalized = normalize(path);
+        if seen.insert(normalized.clone()) {
+            files.push(normalized);
+        }
+    }
+
+    files
+}
+
+fn dispatch_markdown_open_requests(app: &AppHandle, paths: Vec<String>) {
+    let paths = normalize_and_collect_unique_paths(paths);
+    if paths.is_empty() {
+        return;
+    }
+
+    // macOS Finder may send an "open file" request for a document that is already open.
+    // We still need to bring the existing app window to front in that case.
+    restore_main_window(app);
+
+    if let Some(state) = app.try_state::<LaunchRequestState>() {
+        if !state.launch_requests_drained.load(Ordering::SeqCst) {
+            if let Ok(mut pending) = state.pending_markdown_files.lock() {
+                let mut merged = pending.clone();
+                merged.extend(paths.iter().cloned());
+                *pending = normalize_and_collect_unique_paths(merged);
+            }
+        }
+    }
+
+    let _ = app.emit(OPEN_REQUESTED_MARKDOWN_FILES_EVENT, paths);
 }
 
 fn read_file(path: &str) -> Result<String, String> {
@@ -894,9 +984,21 @@ fn read_markdown_file(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn get_launch_markdown_files() -> Vec<String> {
+fn get_launch_markdown_files(
+    launch_requests: State<LaunchRequestState>,
+) -> Vec<String> {
     let cwd = env::current_dir().ok();
-    collect_markdown_files(env::args_os().skip(1), cwd.as_deref())
+    let mut files = collect_markdown_files(env::args_os().skip(1), cwd.as_deref());
+
+    if let Ok(mut pending) = launch_requests.pending_markdown_files.lock() {
+        files.extend(pending.drain(..));
+    }
+
+    launch_requests
+        .launch_requests_drained
+        .store(true, Ordering::SeqCst);
+
+    normalize_and_collect_unique_paths(files)
 }
 
 #[tauri::command]
@@ -1729,17 +1831,16 @@ fn move_main_window_to_tray(app: AppHandle) -> Result<(), String> {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             restore_main_window(app);
 
             let cwd = PathBuf::from(cwd);
             let markdown_files = collect_markdown_files(args, Some(cwd.as_path()));
-            if !markdown_files.is_empty() {
-                let _ = app.emit(OPEN_REQUESTED_MARKDOWN_FILES_EVENT, markdown_files);
-            }
+            dispatch_markdown_open_requests(app, markdown_files);
         }))
         .manage(AppLifecycleState::default())
+        .manage(LaunchRequestState::default())
         .setup(|app| {
             let show_item =
                 MenuItem::with_id(app, TRAY_SHOW_ID, "显示 TinyMD", true, None::<&str>)?;
@@ -1884,6 +1985,14 @@ fn main() {
             request_app_exit,
             move_main_window_to_tray
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let RunEvent::Opened { urls } = event {
+            let markdown_files = collect_markdown_files_from_urls(&urls);
+            dispatch_markdown_open_requests(app_handle, markdown_files);
+        }
+    });
 }
