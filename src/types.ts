@@ -10,4 +10,7 @@ export type EditorTab = {
   dirty: boolean;
   storageKind: TabStorageKind;
   loaded: boolean;
+  externalChangeKind?: "modified" | "missing" | null;
+  externalChangePending?: boolean;
+  externalChangedUnixMs?: number | null;
 };

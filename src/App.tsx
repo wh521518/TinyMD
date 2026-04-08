@@ -92,6 +92,18 @@ type AssetImportStatusPayload = {
   error?: string | null;
 };
 
+type ExternalDocumentChangePayload = {
+  path: string;
+  kind: "modified" | "removed";
+  modifiedUnixMs?: number | null;
+};
+
+type WatchedDocumentStatePayload = {
+  modifiedUnixMs?: number | null;
+  exists: boolean;
+  sizeBytes?: number | null;
+};
+
 type AssetUploadSession = {
   uploadId: string;
   relativePath: string;
@@ -201,6 +213,12 @@ const TEMP_DOCS_PATH_SEGMENT = "/temp-docs/";
 const normalizeDocumentPathForStorageCheck = (path: string | null | undefined) =>
   path?.trim().replace(/\\/g, "/").toLowerCase() ?? "";
 
+const isSameDocumentPath = (
+  left: string | null | undefined,
+  right: string | null | undefined,
+) =>
+  normalizeDocumentPathForStorageCheck(left) === normalizeDocumentPathForStorageCheck(right);
+
 const isTemporaryDocumentPath = (path: string | null | undefined) =>
   !path || normalizeDocumentPathForStorageCheck(path).includes(TEMP_DOCS_PATH_SEGMENT);
 
@@ -246,6 +264,7 @@ const OPEN_REQUESTED_MARKDOWN_FILES_EVENT = "open-requested-markdown-files";
 const ASSET_IMPORT_STATUS_EVENT = "asset-import-status";
 const OPEN_DROPPED_MARKDOWN_FILES_EVENT = "open-dropped-markdown-files";
 const INSERT_DROPPED_ASSET_PATHS_EVENT = "insert-dropped-asset-paths";
+const DOCUMENT_EXTERNAL_CHANGE_EVENT = "document-external-change";
 const RECOVERED_PREFIX = "recovered:";
 const LANGUAGE_STORAGE_KEY = "tinymd.language";
 const IMAGE_FOLDER_STORAGE_KEY = "tinymd.imageFolder";
@@ -548,6 +567,17 @@ type UiText = {
   unsavedSave: string;
   unsavedDiscard: string;
   unsavedCancel: string;
+  externalChangedAutoReloaded: (title: string) => string;
+  externalChangedWhileDirty: (title: string) => string;
+  externalChangedKept: (title: string) => string;
+  externalMissing: (title: string) => string;
+  externalChangeReloadAction: string;
+  externalChangeKeepAction: string;
+  externalChangeDismissAction: string;
+  externalConflictBanner: (title: string) => string;
+  externalMissingBanner: (title: string) => string;
+  statusExternalModified: string;
+  statusExternalMissing: string;
 };
 
 const UI_TEXT: Record<UiLanguage, UiText> = {
@@ -666,6 +696,21 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     unsavedSave: "保存",
     unsavedDiscard: "不保存",
     unsavedCancel: "取消",
+    externalChangedAutoReloaded: (title) => `检测到 ${title} 已被其他程序修改，已自动重新加载。`,
+    externalChangedWhileDirty: (title) =>
+      `检测到 ${title} 已被其他程序修改。当前标签还有未保存内容，请决定保留本地修改还是重新加载外部版本。`,
+    externalChangedKept: (title) => `已保留 ${title} 的当前修改，外部更新尚未合并。`,
+    externalMissing: (title) =>
+      `检测到 ${title} 对应的文件已被删除或移走。当前内容仍保留在编辑器里，保存可重新创建文件。`,
+    externalChangeReloadAction: "重新加载",
+    externalChangeKeepAction: "保留当前修改",
+    externalChangeDismissAction: "知道了",
+    externalConflictBanner: (title) =>
+      `“${title}”已被其他程序修改。你当前还有未保存内容。`,
+    externalMissingBanner: (title) =>
+      `“${title}”对应的文件已被删除或移走。当前内容仍保留在编辑器中。`,
+    statusExternalModified: "外部已更新",
+    statusExternalMissing: "文件缺失",
   },
   "en-US": {
     menuOpen: "Open(O)",
@@ -784,6 +829,23 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     unsavedSave: "Save",
     unsavedDiscard: "Don't Save",
     unsavedCancel: "Cancel",
+    externalChangedAutoReloaded: (title) =>
+      `${title} was updated by another program and has been reloaded.`,
+    externalChangedWhileDirty: (title) =>
+      `${title} was updated by another program. This tab still has unsaved changes, so choose whether to keep your local edits or reload the external version.`,
+    externalChangedKept: (title) =>
+      `Kept the current edits for ${title}. The external update has not been merged.`,
+    externalMissing: (title) =>
+      `The file for ${title} was deleted or moved. The current content is still kept in the editor, and saving will recreate it.`,
+    externalChangeReloadAction: "Reload",
+    externalChangeKeepAction: "Keep Local Changes",
+    externalChangeDismissAction: "Dismiss",
+    externalConflictBanner: (title) =>
+      `${title} was changed by another program. This tab still has unsaved changes.`,
+    externalMissingBanner: (title) =>
+      `The file for ${title} was deleted or moved. The current content is still kept in the editor.`,
+    statusExternalModified: "Externally Updated",
+    statusExternalMissing: "File Missing",
   },
 };
 
@@ -1180,6 +1242,11 @@ export default function App() {
   const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const closeActionMenuRef = useRef<HTMLDivElement | null>(null);
   const languageMenuRef = useRef<HTMLDivElement | null>(null);
+  const reloadingExternalTabIdsRef = useRef(new Set<string>());
+  const watchedFileStateRef = useRef(new Map<string, WatchedDocumentStatePayload>());
+  const pendingLocalWriteRef = useRef(
+    new Map<string, { modifiedUnixMs: number | null; sizeBytes: number | null }>(),
+  );
   const [language, setLanguage] = useState<UiLanguage>(initialLanguageRef.current);
   const [imageFolder, setImageFolder] = useState(initialImageFolderRef.current);
   const [closeActionPreference, setCloseActionPreference] = useState<CloseActionPreference>(
@@ -1209,6 +1276,18 @@ export default function App() {
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
     [tabs, activeTabId],
   );
+  const watchedSourcePaths = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          tabs
+            .filter(canUseLocalFilePath)
+            .map((tab) => tab.sourcePath),
+        ),
+      ),
+    [tabs],
+  );
+  const watchedSourcePathsKey = watchedSourcePaths.join("\n");
   const currentWindowTitle = activeTab ? `${activeTab.title} ${APP_NAME}` : APP_NAME;
   const contextMenuTab = useMemo(
     () => tabs.find((tab) => tab.id === tabContextMenu?.tabId) ?? null,
@@ -1382,6 +1461,168 @@ export default function App() {
     };
   });
 
+  const reloadTabFromDisk = useEffectEvent(
+    async (tabId: string, announce?: ((title: string) => string) | string | null) => {
+      const targetTab = tabsRef.current.find((tab) => tab.id === tabId);
+      if (!targetTab || !canUseLocalFilePath(targetTab)) {
+        return false;
+      }
+
+      if (reloadingExternalTabIdsRef.current.has(tabId)) {
+        return false;
+      }
+
+      reloadingExternalTabIdsRef.current.add(tabId);
+      try {
+        const content = await invoke<string>("read_markdown_file", {
+          path: targetTab.sourcePath,
+        });
+        const normalizedContent = normalizeTaskListMarkdown(content);
+        logTaskListDebug("app:load", content, normalizedContent, {
+          tabId: targetTab.id,
+          sourcePath: targetTab.sourcePath,
+          reason: "external-reload",
+        });
+        setTabs((current) =>
+          current.map((tab) =>
+            tab.id === targetTab.id
+              ? {
+                  ...tab,
+                  content: normalizedContent,
+                  savedContent: normalizedContent,
+                  dirty: false,
+                  loaded: true,
+                  externalChangeKind: null,
+                  externalChangePending: false,
+                  externalChangedUnixMs: null,
+                }
+              : tab,
+          ),
+        );
+        void syncWatchedFileState(targetTab.sourcePath);
+
+        if (announce) {
+          setMessage(
+            typeof announce === "function" ? announce(targetTab.title) : announce,
+          );
+        }
+        return true;
+      } catch (error) {
+        setMessage(t.loadFailed(targetTab.title, String(error)));
+        return false;
+      } finally {
+        reloadingExternalTabIdsRef.current.delete(tabId);
+      }
+    },
+  );
+
+  const dismissExternalChange = useEffectEvent((tabId: string) => {
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === tabId
+          ? {
+              ...tab,
+              externalChangePending: false,
+            }
+          : tab,
+      ),
+    );
+  });
+
+  const keepLocalExternalChange = useEffectEvent((tabId: string) => {
+    const targetTab = tabsRef.current.find((tab) => tab.id === tabId);
+    dismissExternalChange(tabId);
+    if (targetTab) {
+      setMessage(t.externalChangedKept(targetTab.title));
+    }
+  });
+
+  const syncWatchedFileState = useEffectEvent(async (path: string | null | undefined) => {
+    if (!path) {
+      return;
+    }
+
+    try {
+      const state = await invoke<WatchedDocumentStatePayload>("read_markdown_file_watch_state", {
+        path,
+      });
+      watchedFileStateRef.current.set(path, state);
+    } catch (error) {
+      console.warn("[TinyMD][external-watch] sync state failed", path, error);
+    }
+  });
+
+  const syncWatchedFileStateFromSnapshot = useEffectEvent(
+    (path: string | null | undefined, snapshot: WatchedDocumentStatePayload | null | undefined) => {
+      if (!path || !snapshot) {
+        return;
+      }
+
+      watchedFileStateRef.current.set(path, snapshot);
+    },
+  );
+
+  const handleExternalDocumentChange = useEffectEvent((payload: ExternalDocumentChangePayload) => {
+    console.info("[TinyMD][external-watch] received", payload);
+    const pendingLocalWrite = pendingLocalWriteRef.current.get(payload.path);
+    if (
+      payload.kind === "modified" &&
+      pendingLocalWrite &&
+      pendingLocalWrite.modifiedUnixMs === (payload.modifiedUnixMs ?? null)
+    ) {
+      pendingLocalWriteRef.current.delete(payload.path);
+      watchedFileStateRef.current.set(payload.path, {
+        exists: true,
+        modifiedUnixMs: payload.modifiedUnixMs ?? null,
+        sizeBytes: pendingLocalWrite.sizeBytes,
+      });
+      console.info("[TinyMD][external-watch] ignored local write event", payload.path);
+      return;
+    }
+
+    watchedFileStateRef.current.set(payload.path, {
+      exists: payload.kind !== "removed",
+      modifiedUnixMs: payload.modifiedUnixMs ?? null,
+      sizeBytes: watchedFileStateRef.current.get(payload.path)?.sizeBytes ?? null,
+    });
+    const targetTab = tabsRef.current.find((tab) =>
+      isSameDocumentPath(tab.sourcePath, payload.path),
+    );
+
+    if (!targetTab || !canUseLocalFilePath(targetTab)) {
+      console.info("[TinyMD][external-watch] no target tab matched", payload.path);
+      return;
+    }
+
+    if (
+      payload.modifiedUnixMs &&
+      targetTab.externalChangedUnixMs &&
+      payload.modifiedUnixMs <= targetTab.externalChangedUnixMs &&
+      targetTab.externalChangeKind === (payload.kind === "removed" ? "missing" : "modified")
+    ) {
+      return;
+    }
+
+    if (payload.kind === "removed") {
+      setTabs((current) =>
+        current.map((tab) =>
+          tab.id === targetTab.id
+            ? {
+                ...tab,
+                dirty: true,
+                externalChangeKind: "missing",
+                externalChangePending: false,
+                externalChangedUnixMs: payload.modifiedUnixMs ?? Date.now(),
+              }
+            : tab,
+        ),
+      );
+      return;
+    }
+
+    void reloadTabFromDisk(targetTab.id, null);
+  });
+
   const saveEditorSessionSnapshot = useEffectEvent(async (
     sessionTabs = tabsRef.current,
     sessionActiveTabId = activeTabIdRef.current,
@@ -1420,6 +1661,94 @@ export default function App() {
   useEffect(() => {
     activeTabIdRef.current = activeTabId;
   }, [activeTabId]);
+
+  useEffect(() => {
+    void invoke("sync_watched_markdown_files", {
+      paths: watchedSourcePaths,
+    }).catch((error) => {
+      console.warn("[TinyMD] failed to sync watched markdown files", error);
+    });
+  }, [watchedSourcePathsKey]);
+
+  useEffect(() => {
+    const activePaths = new Set(watchedSourcePaths);
+    watchedFileStateRef.current.forEach((_, path) => {
+      if (!activePaths.has(path)) {
+        watchedFileStateRef.current.delete(path);
+      }
+    });
+
+    if (watchedSourcePaths.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const poll = async () => {
+      const paths = [...watchedSourcePaths];
+      for (const path of paths) {
+        try {
+          const state = await invoke<WatchedDocumentStatePayload>("read_markdown_file_watch_state", {
+            path,
+          });
+          if (cancelled) {
+            return;
+          }
+
+          const previous = watchedFileStateRef.current.get(path);
+          watchedFileStateRef.current.set(path, state);
+
+          if (!previous) {
+            continue;
+          }
+
+          if (previous.exists && !state.exists) {
+            handleExternalDocumentChange({
+              path,
+              kind: "removed",
+              modifiedUnixMs: state.modifiedUnixMs ?? null,
+            });
+            continue;
+          }
+
+          if (
+            state.exists &&
+            previous.modifiedUnixMs !== undefined &&
+            previous.modifiedUnixMs !== null &&
+            state.modifiedUnixMs !== previous.modifiedUnixMs
+          ) {
+            const pendingLocalWrite = pendingLocalWriteRef.current.get(path);
+            if (
+              pendingLocalWrite &&
+              pendingLocalWrite.modifiedUnixMs === (state.modifiedUnixMs ?? null) &&
+              pendingLocalWrite.sizeBytes === (state.sizeBytes ?? null)
+            ) {
+              pendingLocalWriteRef.current.delete(path);
+              continue;
+            }
+
+            handleExternalDocumentChange({
+              path,
+              kind: "modified",
+              modifiedUnixMs: state.modifiedUnixMs ?? null,
+            });
+          }
+        } catch (error) {
+          console.warn("[TinyMD][external-watch] poll failed", path, error);
+        }
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [handleExternalDocumentChange, watchedSourcePathsKey]);
 
   useEffect(() => {
     closeActionPreferenceRef.current = closeActionPreference;
@@ -1484,6 +1813,9 @@ export default function App() {
           ? t.openedFile(loadedTabs[0].title)
           : t.openedFiles(loadedTabs.length),
       );
+      loadedTabs.forEach((tab) => {
+        void syncWatchedFileState(tab.sourcePath);
+      });
       return true;
     } catch (error) {
       setMessage(t.openFailed(String(error)));
@@ -1572,10 +1904,15 @@ export default function App() {
         : normalizedContent;
 
       if (!usesTemporaryDocumentStorage(tab)) {
-        await invoke("save_markdown_file", {
+        const snapshot = await invoke<WatchedDocumentStatePayload>("save_markdown_file", {
           path: targetPath,
           content: normalizedContent,
         });
+        pendingLocalWriteRef.current.set(targetPath, {
+          modifiedUnixMs: snapshot.modifiedUnixMs ?? null,
+          sizeBytes: snapshot.sizeBytes ?? null,
+        });
+        syncWatchedFileStateFromSnapshot(targetPath, snapshot);
       }
 
       const nextTab: EditorTab = {
@@ -1589,6 +1926,9 @@ export default function App() {
         dirty: false,
         storageKind: "saved",
         loaded: true,
+        externalChangeKind: null,
+        externalChangePending: false,
+        externalChangedUnixMs: null,
       };
 
       setTabs((current) =>
@@ -1598,6 +1938,9 @@ export default function App() {
             : item,
         ),
       );
+      if (usesTemporaryDocumentStorage(tab)) {
+        void syncWatchedFileState(targetPath);
+      }
       setActiveTabId(targetPath);
       setMessage(t.saveSuccess(getFileName(targetPath)));
       return nextTab;
@@ -1955,6 +2298,20 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
 
+    void listen<ExternalDocumentChangePayload>(DOCUMENT_EXTERNAL_CHANGE_EVENT, (event) => {
+      handleExternalDocumentChange(event.payload);
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [handleExternalDocumentChange]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
     void listen<AssetImportStatusPayload>(ASSET_IMPORT_STATUS_EVENT, (event) => {
       const payload = event.payload;
       publishAttachmentImportState(payload);
@@ -2213,10 +2570,14 @@ export default function App() {
                   savedContent: normalizedContent,
                   dirty: false,
                   loaded: true,
+                  externalChangeKind: null,
+                  externalChangePending: false,
+                  externalChangedUnixMs: null,
                 }
               : tab,
           ),
         );
+        void syncWatchedFileState(targetTab.sourcePath);
 
         if (activeTabIdRef.current === targetTab.id) {
           setMessage(t.loadedTab(targetTab.title));

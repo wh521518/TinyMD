@@ -16,7 +16,8 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -39,6 +40,8 @@ const OPEN_REQUESTED_MARKDOWN_FILES_EVENT: &str = "open-requested-markdown-files
 const ASSET_IMPORT_STATUS_EVENT: &str = "asset-import-status";
 const OPEN_DROPPED_MARKDOWN_FILES_EVENT: &str = "open-dropped-markdown-files";
 const INSERT_DROPPED_ASSET_PATHS_EVENT: &str = "insert-dropped-asset-paths";
+const DOCUMENT_EXTERNAL_CHANGE_EVENT: &str = "document-external-change";
+const FILE_WATCH_POLL_INTERVAL_MS: u64 = 1200;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +55,29 @@ struct DropPositionPayload {
 struct DroppedAssetPathsPayload {
     paths: Vec<String>,
     position: DropPositionPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalDocumentChangePayload {
+    path: String,
+    kind: String,
+    modified_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WatchedDocumentSnapshot {
+    modified_unix_ms: Option<u64>,
+    exists: bool,
+    size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchedDocumentSnapshotPayload {
+    modified_unix_ms: Option<u64>,
+    exists: bool,
+    size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -238,6 +264,11 @@ struct LaunchRequestState {
     launch_requests_drained: AtomicBool,
 }
 
+#[derive(Default)]
+struct ExternalFileWatchState {
+    watched_documents: Mutex<HashMap<String, WatchedDocumentSnapshot>>,
+}
+
 fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -247,6 +278,108 @@ fn is_markdown(path: &Path) -> bool {
 
 fn normalize(path: PathBuf) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn get_modified_unix_ms(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn read_watched_document_snapshot(path: &str) -> WatchedDocumentSnapshot {
+    let target = Path::new(path);
+    let metadata = fs::metadata(target).ok();
+    WatchedDocumentSnapshot {
+        modified_unix_ms: get_modified_unix_ms(target),
+        exists: metadata.is_some(),
+        size_bytes: metadata.as_ref().map(|value| value.len()),
+    }
+}
+
+fn update_watched_document_snapshot(
+    watch_state: &ExternalFileWatchState,
+    path: &str,
+    snapshot: WatchedDocumentSnapshot,
+) {
+    if let Ok(mut watched) = watch_state.watched_documents.lock() {
+        watched.insert(path.to_string(), snapshot);
+    }
+}
+
+fn emit_external_document_change(
+    app: &AppHandle,
+    path: &str,
+    kind: &str,
+    modified_unix_ms: Option<u64>,
+) {
+    eprintln!(
+        "[TinyMD][external-watch] emit kind={kind} path={path} modified_unix_ms={modified_unix_ms:?}"
+    );
+    let _ = app.emit(
+        DOCUMENT_EXTERNAL_CHANGE_EVENT,
+        ExternalDocumentChangePayload {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            modified_unix_ms,
+        },
+    );
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit(
+            DOCUMENT_EXTERNAL_CHANGE_EVENT,
+            ExternalDocumentChangePayload {
+                path: path.to_string(),
+                kind: kind.to_string(),
+                modified_unix_ms,
+            },
+        );
+    }
+}
+
+fn start_external_document_watch_loop(app: AppHandle) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(FILE_WATCH_POLL_INTERVAL_MS));
+
+            let Some(watch_state) = app.try_state::<ExternalFileWatchState>() else {
+                continue;
+            };
+
+            let watched_paths = if let Ok(watched) = watch_state.watched_documents.lock() {
+                watched.clone()
+            } else {
+                continue;
+            };
+
+            for (path, previous) in watched_paths {
+                let current = read_watched_document_snapshot(&path);
+
+                if previous.exists && !current.exists {
+                    emit_external_document_change(&app, &path, "removed", None);
+                    update_watched_document_snapshot(&watch_state, &path, current);
+                    continue;
+                }
+
+                if !current.exists {
+                    continue;
+                }
+
+                if !previous.exists
+                    || previous.modified_unix_ms != current.modified_unix_ms
+                {
+                    emit_external_document_change(
+                        &app,
+                        &path,
+                        "modified",
+                        current.modified_unix_ms,
+                    );
+                    update_watched_document_snapshot(&watch_state, &path, current);
+                }
+            }
+        }
+    });
 }
 
 fn restore_main_window(app: &AppHandle) {
@@ -1002,8 +1135,61 @@ fn get_launch_markdown_files(
 }
 
 #[tauri::command]
-fn save_markdown_file(path: String, content: String) -> Result<(), String> {
-    write_file(&path, &content)
+fn save_markdown_file(
+    path: String,
+    content: String,
+    watch_state: State<ExternalFileWatchState>,
+) -> Result<WatchedDocumentSnapshotPayload, String> {
+    write_file(&path, &content)?;
+    let snapshot = read_watched_document_snapshot(&path);
+    update_watched_document_snapshot(&watch_state, &path, snapshot.clone());
+    Ok(WatchedDocumentSnapshotPayload {
+        modified_unix_ms: snapshot.modified_unix_ms,
+        exists: snapshot.exists,
+        size_bytes: snapshot.size_bytes,
+    })
+}
+
+#[tauri::command]
+fn sync_watched_markdown_files(
+    paths: Vec<String>,
+    watch_state: State<ExternalFileWatchState>,
+) {
+    let unique_paths = normalize_and_collect_unique_paths(
+        paths
+            .into_iter()
+            .filter(|path| is_markdown(Path::new(path))),
+    );
+
+    if let Ok(mut watched) = watch_state.watched_documents.lock() {
+        watched.retain(|path, _| unique_paths.iter().any(|candidate| candidate == path));
+
+        for path in unique_paths {
+            let snapshot = read_watched_document_snapshot(&path);
+            eprintln!(
+                "[TinyMD][external-watch] sync path={} exists={} modified_unix_ms={:?} size_bytes={:?}",
+                path,
+                snapshot.exists,
+                snapshot.modified_unix_ms,
+                snapshot.size_bytes
+            );
+            watched.insert(path, snapshot);
+        }
+    }
+}
+
+#[tauri::command]
+fn read_markdown_file_watch_state(path: String) -> Result<WatchedDocumentSnapshotPayload, String> {
+    if !is_markdown(Path::new(&path)) {
+        return Err(format!("仅支持 Markdown 文件: {path}"));
+    }
+
+    let snapshot = read_watched_document_snapshot(&path);
+    Ok(WatchedDocumentSnapshotPayload {
+        modified_unix_ms: snapshot.modified_unix_ms,
+        exists: snapshot.exists,
+        size_bytes: snapshot.size_bytes,
+    })
 }
 
 #[tauri::command]
@@ -1841,7 +2027,10 @@ fn main() {
         }))
         .manage(AppLifecycleState::default())
         .manage(LaunchRequestState::default())
+        .manage(ExternalFileWatchState::default())
         .setup(|app| {
+            start_external_document_watch_loop(app.handle().clone());
+
             let show_item =
                 MenuItem::with_id(app, TRAY_SHOW_ID, "显示 TinyMD", true, None::<&str>)?;
             let quit_item =
@@ -1964,7 +2153,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_launch_markdown_files,
             read_markdown_file,
+            read_markdown_file_watch_state,
             save_markdown_file,
+            sync_watched_markdown_files,
             load_editor_session,
             save_editor_session,
             open_external_url,

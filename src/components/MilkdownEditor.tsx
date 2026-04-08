@@ -6,6 +6,7 @@ import { Crepe } from "@milkdown/crepe";
 import type { ListenerManager } from "@milkdown/kit/plugin/listener";
 import { isTextOnlySlice } from "@milkdown/prose";
 import { DOMParser, DOMSerializer } from "@milkdown/prose/model";
+import { replaceAll } from "@milkdown/utils";
 import { EditorView as CodeMirrorView } from "@codemirror/view";
 import { invoke } from "@tauri-apps/api/core";
 import { forwardRef, useEffect, useRef } from "react";
@@ -403,7 +404,7 @@ export const MilkdownEditor = forwardRef<
   ref,
 ) {
   const usesMacCustomListView = isMacWebKit();
-  const normalizedInitialMarkdown = normalizeTaskListMarkdown(markdown);
+  const normalizedMarkdown = normalizeTaskListMarkdown(markdown);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<Crepe | null>(null);
   const onChangeRef = useRef(onChange);
@@ -420,9 +421,12 @@ export const MilkdownEditor = forwardRef<
   const imageSourceCacheRef = useRef(new Map<string, string>());
   const pendingImageLoadsRef = useRef(new Map<string, Promise<string>>());
   const isComposingRef = useRef(false);
-  const lastMarkdownRef = useRef(normalizedInitialMarkdown);
+  const lastMarkdownRef = useRef(normalizedMarkdown);
   const flushTimerRef = useRef<number | null>(null);
+  const propSyncTimerRef = useRef<number | null>(null);
   const isEditorReadyRef = useRef(false);
+  const syncDecorationsRef = useRef<(() => void) | null>(null);
+  const isApplyingExternalMarkdownRef = useRef(false);
 
   useEffect(() => {
     onChangeRef.current = onChange;
@@ -469,6 +473,10 @@ export const MilkdownEditor = forwardRef<
   }, [documentPath]);
 
   const emitMarkdown = (value: string) => {
+    if (isApplyingExternalMarkdownRef.current) {
+      return;
+    }
+
     const normalizedValue = normalizeTaskListMarkdown(value);
     logTaskListDebug("milkdown:emit", value, normalizedValue, {
       documentPath: documentPathRef.current,
@@ -514,7 +522,7 @@ export const MilkdownEditor = forwardRef<
 
     const editor = new Crepe({
       root: rootRef.current,
-      defaultValue: normalizedInitialMarkdown,
+      defaultValue: normalizedMarkdown,
       features: disableListItemFeature
         ? {
             [Crepe.Feature.ListItem]: false,
@@ -610,6 +618,7 @@ export const MilkdownEditor = forwardRef<
             });
           });
         };
+        syncDecorationsRef.current = scheduleDecorationSync;
 
         const insertTextCursorAfterAttachment = (transaction: typeof view.state.tr) => {
           const { selection } = transaction;
@@ -1285,9 +1294,15 @@ export const MilkdownEditor = forwardRef<
       disposed = true;
       isComposingRef.current = false;
       isEditorReadyRef.current = false;
+      syncDecorationsRef.current = null;
+      isApplyingExternalMarkdownRef.current = false;
       if (flushTimerRef.current !== null) {
         window.clearTimeout(flushTimerRef.current);
         flushTimerRef.current = null;
+      }
+      if (propSyncTimerRef.current !== null) {
+        window.clearTimeout(propSyncTimerRef.current);
+        propSyncTimerRef.current = null;
       }
 
       const instance = editorRef.current;
@@ -1304,8 +1319,52 @@ export const MilkdownEditor = forwardRef<
   }, [docKey]);
 
   useEffect(() => {
-    lastMarkdownRef.current = normalizeTaskListMarkdown(markdown);
-  }, [markdown]);
+    const editor = editorRef.current;
+    if (!editor || !isEditorReadyRef.current) {
+      lastMarkdownRef.current = normalizedMarkdown;
+      return;
+    }
+
+    if (normalizedMarkdown === lastMarkdownRef.current) {
+      return;
+    }
+
+    if (propSyncTimerRef.current !== null) {
+      window.clearTimeout(propSyncTimerRef.current);
+      propSyncTimerRef.current = null;
+    }
+
+    isApplyingExternalMarkdownRef.current = true;
+    lastMarkdownRef.current = normalizedMarkdown;
+    editor.editor.action(replaceAll(normalizedMarkdown, false));
+    syncDecorationsRef.current?.();
+
+    propSyncTimerRef.current = window.setTimeout(() => {
+      propSyncTimerRef.current = null;
+
+      if (editorRef.current !== editor) {
+        isApplyingExternalMarkdownRef.current = false;
+        return;
+      }
+
+      let canonicalMarkdown = normalizedMarkdown;
+      try {
+        canonicalMarkdown = normalizeTaskListMarkdown(editor.getMarkdown());
+      } catch {
+        isApplyingExternalMarkdownRef.current = false;
+        return;
+      }
+
+      isApplyingExternalMarkdownRef.current = false;
+
+      if (canonicalMarkdown === lastMarkdownRef.current) {
+        return;
+      }
+
+      lastMarkdownRef.current = canonicalMarkdown;
+      onChangeRef.current(canonicalMarkdown);
+    }, 0);
+  }, [normalizedMarkdown]);
 
   const setRefs = (node: HTMLDivElement | null) => {
     rootRef.current = node;
