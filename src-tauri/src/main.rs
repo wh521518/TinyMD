@@ -261,7 +261,6 @@ struct AppLifecycleState {
 #[derive(Default)]
 struct LaunchRequestState {
     pending_markdown_files: Mutex<Vec<String>>,
-    launch_requests_drained: AtomicBool,
 }
 
 #[derive(Default)]
@@ -491,12 +490,10 @@ fn dispatch_markdown_open_requests(app: &AppHandle, paths: Vec<String>) {
     restore_main_window(app);
 
     if let Some(state) = app.try_state::<LaunchRequestState>() {
-        if !state.launch_requests_drained.load(Ordering::SeqCst) {
-            if let Ok(mut pending) = state.pending_markdown_files.lock() {
-                let mut merged = pending.clone();
-                merged.extend(paths.iter().cloned());
-                *pending = normalize_and_collect_unique_paths(merged);
-            }
+        if let Ok(mut pending) = state.pending_markdown_files.lock() {
+            let mut merged = pending.clone();
+            merged.extend(paths.iter().cloned());
+            *pending = normalize_and_collect_unique_paths(merged);
         }
     }
 
@@ -512,10 +509,16 @@ fn write_file(path: &str, content: &str) -> Result<(), String> {
 }
 
 fn is_supported_image_extension(extension: &str) -> bool {
+    let normalized = extension.to_ascii_lowercase();
     matches!(
-        extension.to_ascii_lowercase().as_str(),
+        normalized.as_str(),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif"
-    )
+    ) || is_transcode_image_extension(&normalized)
+}
+
+/// webview 无法原生渲染、但可由 Rust 解码后转 PNG 的格式（如 TIFF）。
+fn is_transcode_image_extension(extension: &str) -> bool {
+    matches!(extension.to_ascii_lowercase().as_str(), "tiff" | "tif")
 }
 
 fn image_mime_type(path: &Path) -> Option<&'static str> {
@@ -1108,6 +1111,11 @@ fn launch_external_url(url: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn export_write_bytes(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    fs::write(&path, bytes).map_err(|err| format!("无法写入导出文件 {path}: {err}"))
+}
+
+#[tauri::command]
 fn read_markdown_file(path: String) -> Result<String, String> {
     if !is_markdown(Path::new(&path)) {
         return Err(format!("仅支持 Markdown 文件: {path}"));
@@ -1127,11 +1135,18 @@ fn get_launch_markdown_files(
         files.extend(pending.drain(..));
     }
 
-    launch_requests
-        .launch_requests_drained
-        .store(true, Ordering::SeqCst);
-
     normalize_and_collect_unique_paths(files)
+}
+
+#[tauri::command]
+fn take_pending_markdown_files(
+    launch_requests: State<LaunchRequestState>,
+) -> Vec<String> {
+    if let Ok(mut pending) = launch_requests.pending_markdown_files.lock() {
+        return normalize_and_collect_unique_paths(pending.drain(..));
+    }
+
+    Vec::new()
 }
 
 #[tauri::command]
@@ -1466,12 +1481,35 @@ fn read_image_data_url(path: String) -> Result<String, String> {
         return Err(format!("图片文件不存在: {}", target.display()));
     }
 
-    let mime_type = image_mime_type(&target)
-        .ok_or_else(|| format!("不支持的图片格式: {}", target.display()))?;
     let bytes =
         fs::read(&target).map_err(|err| format!("无法读取图片文件 {}: {err}", target.display()))?;
-    let encoded = BASE64_STANDARD.encode(bytes);
-    Ok(format!("data:{mime_type};base64,{encoded}"))
+
+    // webview 可原生渲染的格式：直接输出原始字节，零解码开销。
+    if let Some(mime_type) = image_mime_type(&target) {
+        let encoded = BASE64_STANDARD.encode(&bytes);
+        return Ok(format!("data:{mime_type};base64,{encoded}"));
+    }
+
+    // 非原生格式（如 TIFF）：用 image crate 解码后转成 PNG，保证 mac/Windows 都能显示。
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if is_transcode_image_extension(extension) {
+        let decoded = image::load_from_memory(&bytes)
+            .map_err(|err| format!("无法解码图片 {}: {err}", target.display()))?;
+        let mut png_bytes: Vec<u8> = Vec::new();
+        decoded
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .map_err(|err| format!("无法将图片转换为 PNG {}: {err}", target.display()))?;
+        let encoded = BASE64_STANDARD.encode(&png_bytes);
+        return Ok(format!("data:image/png;base64,{encoded}"));
+    }
+
+    Err(format!("不支持的图片格式: {}", target.display()))
 }
 
 #[tauri::command]
@@ -2152,7 +2190,9 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_launch_markdown_files,
+            take_pending_markdown_files,
             read_markdown_file,
+            export_write_bytes,
             read_markdown_file_watch_state,
             save_markdown_file,
             sync_watched_markdown_files,

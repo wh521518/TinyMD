@@ -26,6 +26,7 @@ type MilkdownEditorProps = {
   documentPath: string | null;
   markdown: string;
   onChange: (markdown: string) => void;
+  onCanonicalizeMarkdown?: (markdown: string) => void;
   attachmentRevealLabel: string;
   attachmentImportingLabel: string;
   attachmentImportFailedLabel: string;
@@ -391,6 +392,7 @@ export const MilkdownEditor = forwardRef<
     documentPath,
     markdown,
     onChange,
+    onCanonicalizeMarkdown,
     attachmentRevealLabel,
     attachmentImportingLabel,
     attachmentImportFailedLabel,
@@ -408,6 +410,7 @@ export const MilkdownEditor = forwardRef<
   const rootRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<Crepe | null>(null);
   const onChangeRef = useRef(onChange);
+  const onCanonicalizeMarkdownRef = useRef(onCanonicalizeMarkdown);
   const attachmentRevealLabelRef = useRef(attachmentRevealLabel);
   const attachmentImportingLabelRef = useRef(attachmentImportingLabel);
   const attachmentImportFailedLabelRef = useRef(attachmentImportFailedLabel);
@@ -427,10 +430,15 @@ export const MilkdownEditor = forwardRef<
   const isEditorReadyRef = useRef(false);
   const syncDecorationsRef = useRef<(() => void) | null>(null);
   const isApplyingExternalMarkdownRef = useRef(false);
+  const isBootstrappingEditorRef = useRef(true);
 
   useEffect(() => {
     onChangeRef.current = onChange;
   }, [onChange]);
+
+  useEffect(() => {
+    onCanonicalizeMarkdownRef.current = onCanonicalizeMarkdown;
+  }, [onCanonicalizeMarkdown]);
 
   useEffect(() => {
     attachmentRevealLabelRef.current = attachmentRevealLabel;
@@ -477,6 +485,10 @@ export const MilkdownEditor = forwardRef<
       return;
     }
 
+    if (isBootstrappingEditorRef.current) {
+      return;
+    }
+
     const normalizedValue = normalizeTaskListMarkdown(value);
     logTaskListDebug("milkdown:emit", value, normalizedValue, {
       documentPath: documentPathRef.current,
@@ -507,6 +519,7 @@ export const MilkdownEditor = forwardRef<
     }
 
     isEditorReadyRef.current = false;
+    isBootstrappingEditorRef.current = true;
     rootRef.current.innerHTML = "";
     // macOS Tauri runs on WKWebView/WebKit. We keep Windows and other platforms
     // on the stock Crepe list-item path, while macOS uses a custom list gutter
@@ -619,6 +632,26 @@ export const MilkdownEditor = forwardRef<
           });
         };
         syncDecorationsRef.current = scheduleDecorationSync;
+
+        window.setTimeout(() => {
+          if (disposed || editorRef.current !== editor) {
+            return;
+          }
+
+          let canonicalMarkdown = normalizedMarkdown;
+          try {
+            canonicalMarkdown = normalizeTaskListMarkdown(editor.getMarkdown());
+          } catch {
+            isBootstrappingEditorRef.current = false;
+            return;
+          }
+
+          lastMarkdownRef.current = canonicalMarkdown;
+          if (canonicalMarkdown !== normalizedMarkdown) {
+            onCanonicalizeMarkdownRef.current?.(canonicalMarkdown);
+          }
+          isBootstrappingEditorRef.current = false;
+        }, 0);
 
         const insertTextCursorAfterAttachment = (transaction: typeof view.state.tr) => {
           const { selection } = transaction;
@@ -1294,6 +1327,7 @@ export const MilkdownEditor = forwardRef<
       disposed = true;
       isComposingRef.current = false;
       isEditorReadyRef.current = false;
+      isBootstrappingEditorRef.current = true;
       syncDecorationsRef.current = null;
       isApplyingExternalMarkdownRef.current = false;
       if (flushTimerRef.current !== null) {
@@ -1362,7 +1396,7 @@ export const MilkdownEditor = forwardRef<
       }
 
       lastMarkdownRef.current = canonicalMarkdown;
-      onChangeRef.current(canonicalMarkdown);
+      onCanonicalizeMarkdownRef.current?.(canonicalMarkdown);
     }, 0);
   }, [normalizedMarkdown]);
 

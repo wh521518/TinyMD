@@ -6,6 +6,11 @@
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
+    "core:window:allow-set-size",
+    "core:window:allow-inner-size",
+    "core:window:allow-scale-factor",
+    "core:window:allow-is-maximized",
+    "core:webview:allow-set-webview-zoom",
     "dialog:default"
   ]
 }

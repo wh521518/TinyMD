@@ -1,7 +1,7 @@
 {
   "name": "rust-milkdown",
   "private": true,
-  "version": "1.0.0-beat.10",
+  "version": "1.0.0-beat.11",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 1420",
@@ -17,6 +17,9 @@
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.4.0",
     "clsx": "^2.1.1",
+    "html-to-image": "^1.11.13",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^4.2.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

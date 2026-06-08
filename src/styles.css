@@ -15,6 +15,7 @@
   --selected: #e9e9e9;
   --hover: #f1f1f1;
   --code: #eeeeee;
+  --search-highlight: #fff36a;
   --shadow: none;
   font-family: var(--font-ui);
   color: var(--text);
@@ -81,7 +82,7 @@ button {
   align-items: center;
   justify-content: flex-start;
   gap: 0;
-  min-height: 30px;
+  min-height: 26px;
   padding: 0 6px;
   border-bottom: 0;
   background: var(--panel-2);
@@ -115,7 +116,8 @@ button {
 
 .header-actions {
   position: relative;
-  z-index: 1;
+  /* 必须高于标签栏(10)，否则下拉菜单（导出/语言/关闭动作）会被标签栏盖住、点击落空。 */
+  z-index: 20;
 }
 
 .header-menu {
@@ -167,12 +169,12 @@ button {
 }
 
 .menu-button {
-  min-height: 30px;
+  min-height: 26px;
   padding: 0 10px;
   background: transparent;
   color: var(--text);
   font-size: 12px;
-  line-height: 30px;
+  line-height: 26px;
 }
 
 .menu-button.is-active {
@@ -378,13 +380,15 @@ button {
   gap: 1px;
   padding: 0;
   border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
+  /* 与正文的分隔线交给滚动容器自身的 border-top（见 .editor-shell / textarea），
+     那是滚动盒的自有边框、内容被裁在其内侧，任意缩放都不会被盖。这里不再画下边框、
+     也无需 z-index。 */
   overflow: auto;
   background: var(--border);
 }
 
 .tabs-bar.is-empty {
-  min-height: 30px;
+  min-height: 28px;
   border-top: 0;
   border-bottom: 0;
   background: var(--panel);
@@ -393,8 +397,8 @@ button {
 .tab-chip {
   flex: 0 0 auto;
   justify-content: space-between;
-  max-width: 220px;
-  min-height: 30px;
+  max-width: 180px;
+  min-height: 28px;
   padding: 0 10px;
   background: var(--selected);
 }
@@ -404,16 +408,123 @@ button {
   background: var(--panel-2);
 }
 
+.tab-tooltip {
+  position: fixed;
+  z-index: 1000;
+  max-width: 480px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+}
+
+.find-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  /* 与标签栏分隔（上）；与正文的分隔线由滚动容器的 border-top 提供。 */
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.find-bar__input {
+  flex: 1;
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.find-bar__count {
+  min-width: 48px;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.find-bar__button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.find-bar__button:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.find-bar__button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.find-bar__button.is-close {
+  border-color: var(--border-strong);
+}
+
+.app-shell.is-search-open .editor-source__textarea::selection,
+.app-shell.is-search-open .editor-shell .milkdown *::selection,
+.app-shell.is-search-open .editor-shell .ProseMirror *::selection {
+  background: var(--search-highlight);
+  color: var(--text);
+}
+
 .tab-chip__title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
   font-size: 13px;
 }
 
+.tab-chip__title-text {
+  font-style: normal;
+}
+
+.tab-chip__title-text.is-dirty {
+  font-style: italic;
+}
+
+.tab-chip__dirty-marker {
+  font-style: normal;
+}
+
 .tab-chip__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  min-height: 22px;
+  margin-right: -4px;
+  border-radius: 999px;
+  cursor: pointer;
   color: var(--text-muted);
   font-size: 14px;
+  line-height: 1;
+  user-select: none;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease;
+}
+
+.tab-chip__close:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 
 .tab-context-menu,
@@ -467,7 +578,13 @@ button {
 
 .editor-shell {
   overflow: auto;
-  padding: 16px 18px 72px 48px;
+  /* 始终预留滚动条占位，保证有无滚动条时正文宽度一致，且与原文模式对齐。 */
+  scrollbar-gutter: stable;
+  /* 与标签栏的分隔线：放在滚动容器自身的上边框，内容被裁在边框内侧，
+     任意缩放比例都不会被滚动合成层盖住。用 2px 降低非整数缩放下的亚像素敏感度。 */
+  border-top: 2px solid var(--border);
+  /* 上 16 / 右 12 / 下 24 / 左 48（左侧留给 block handle，与原文模式对齐）。 */
+  padding: 16px 12px 24px 48px;
   box-sizing: border-box;
 }
 
@@ -480,17 +597,23 @@ button {
 }
 
 .editor-source {
-  overflow: auto;
-  padding: 16px 18px 72px 48px;
+  /* 原文模式由 textarea 自身滚动；外层不再滚动也不加内边距，
+     内边距全部交给 textarea，使其滚动条贴到容器最右边、与 MD 模式 (.editor-shell) 对齐。 */
+  overflow: hidden;
+  padding: 0;
   box-sizing: border-box;
 }
 
 .editor-source__textarea {
   width: 100%;
-  min-height: 100%;
-  height: auto;
-  padding: 0;
+  height: 100%;
+  overflow: auto;
+  /* 与 MD 模式 (.editor-shell) 完全一致的内边距与滚动条占位，保证两种模式左右对齐。 */
+  scrollbar-gutter: stable;
+  padding: 16px 12px 24px 48px;
   border: 0;
+  /* 与标签栏的分隔线：同 .editor-shell，放在滚动容器自身上边框，抗缩放、不被内容盖。 */
+  border-top: 2px solid var(--border);
   outline: none;
   resize: none;
   background: var(--panel);
@@ -564,6 +687,46 @@ button {
 .status-toggle__button:not(.is-active):hover {
   background: var(--hover);
   color: var(--text);
+}
+
+.status-zoom {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.status-zoom__button,
+.status-zoom__value {
+  min-height: 22px;
+  padding: 0 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 22px;
+}
+
+.status-zoom__button {
+  min-width: 24px;
+  font-size: 14px;
+}
+
+.status-zoom__value {
+  min-width: 46px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-zoom__button:hover:not(:disabled),
+.status-zoom__value:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.status-zoom__button:disabled {
+  color: var(--text-muted);
+  opacity: 0.45;
+  cursor: default;
 }
 
 .drag-overlay {
@@ -1038,6 +1201,19 @@ button {
   .cm-selectionBackground,
 .milkdown .milkdown-code-block .cm-content ::selection {
   background: rgba(17, 17, 17, 0.14) !important;
+}
+
+.app-shell.is-search-open .milkdown .milkdown-code-block .cm-selectionBackground,
+.app-shell.is-search-open
+  .milkdown
+  .milkdown-code-block
+  .cm-editor.cm-focused
+  > .cm-scroller
+  > .cm-selectionLayer
+  .cm-selectionBackground,
+.app-shell.is-search-open .milkdown .milkdown-code-block .cm-content ::selection {
+  background: var(--search-highlight) !important;
+  color: var(--text) !important;
 }
 
 .milkdown .milkdown-image-block .image-wrapper .operation {

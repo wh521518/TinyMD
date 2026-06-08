@@ -1,7 +1,7 @@
 import {
   lazy,
   Suspense,
-  startTransition,
+  useCallback,
   useEffect,
   useEffectEvent,
   useMemo,
@@ -10,6 +10,7 @@ import {
   type ClipboardEvent as ReactClipboardEvent,
   type DragEvent as ReactDragEvent,
 } from "react";
+import { renderToPdfBytes, renderToPngBytes } from "./lib/exportDocument";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -17,6 +18,7 @@ import {
   save,
 } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { TabsBar } from "./components/TabsBar";
 import {
@@ -120,6 +122,18 @@ type LocalAssetMetadata = {
   sizeBytes: number;
   modifiedUnixMs?: number | null;
   extension?: string | null;
+};
+
+type TextMatch = {
+  start: number;
+  end: number;
+};
+
+type RichTextMatch = {
+  startNode: Text;
+  startOffset: number;
+  endNode: Text;
+  endOffset: number;
 };
 
 type NativeDropSnapshot = {
@@ -270,6 +284,25 @@ const LANGUAGE_STORAGE_KEY = "tinymd.language";
 const IMAGE_FOLDER_STORAGE_KEY = "tinymd.imageFolder";
 const CLOSE_ACTION_STORAGE_KEY = "tinymd.closeAction";
 const RECENTLY_CLOSED_TABS_STORAGE_KEY = "tinymd.recentlyClosedTabs";
+const CONTENT_ZOOM_STORAGE_KEY = "tinymd.contentZoom";
+
+const CONTENT_ZOOM_MIN = 0.5;
+const CONTENT_ZOOM_MAX = 3;
+const CONTENT_ZOOM_STEP = 0.1;
+const CONTENT_ZOOM_DEFAULT = 1;
+
+// 目录面板宽度（224px + 1px 左边框），用于在显示/隐藏目录时同步增减窗口宽度，
+// 从而保持正文宽度不变。
+const OUTLINE_PANE_TOTAL_WIDTH = 225;
+const MIN_APP_WIDTH = 480;
+
+const clampContentZoom = (value: number): number => {
+  if (!Number.isFinite(value)) {
+    return CONTENT_ZOOM_DEFAULT;
+  }
+  const rounded = Math.round(value * 10) / 10;
+  return Math.min(CONTENT_ZOOM_MAX, Math.max(CONTENT_ZOOM_MIN, rounded));
+};
 const MAX_RECENTLY_CLOSED_TABS = 10;
 const DEFAULT_IMAGE_FOLDER = "_assets";
 const LEGACY_DEFAULT_IMAGE_FOLDER = "assets";
@@ -463,6 +496,17 @@ type UiText = {
   menuNew: string;
   menuSave: string;
   menuImages: string;
+  menuExport: string;
+  exportPdf: string;
+  exportPng: string;
+  exportPdfDialogTitle: string;
+  exportPngDialogTitle: string;
+  exportPdfSaved: (fileName: string) => string;
+  exportPngSaved: (fileName: string) => string;
+  exportCanceled: string;
+  exportFailed: string;
+  exportNoContent: string;
+  exportSwitchToRich: string;
   menuCloseAction: string;
   menuLanguage: string;
   languageChinese: string;
@@ -486,6 +530,10 @@ type UiText = {
   viewLabel: string;
   modeSource: string;
   outlineLabel: string;
+  zoomLabel: string;
+  zoomIn: string;
+  zoomOut: string;
+  zoomReset: string;
   working: string;
   loading: string;
   untitledUnsaved: string;
@@ -499,6 +547,12 @@ type UiText = {
   outlineHeader: string;
   outlineEmpty: string;
   outlinePrompt: string;
+  searchPlaceholder: string;
+  searchPrevious: string;
+  searchNext: string;
+  searchClose: string;
+  searchEmpty: string;
+  searchResultCount: (current: number, total: number) => string;
   dropToOpen: string;
   dropToInsertAssets: string;
   dropMoveToEditorOverlay: string;
@@ -586,6 +640,17 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     menuNew: "新建(N)",
     menuSave: "保存(S)",
     menuImages: "附件(I)",
+    menuExport: "导出",
+    exportPdf: "导出为 PDF",
+    exportPng: "导出为图片(PNG)",
+    exportPdfDialogTitle: "导出为 PDF",
+    exportPngDialogTitle: "导出为图片",
+    exportPdfSaved: (fileName: string) => `已导出 PDF：${fileName}`,
+    exportPngSaved: (fileName: string) => `已导出图片：${fileName}`,
+    exportCanceled: "已取消导出",
+    exportFailed: "导出失败",
+    exportNoContent: "没有可导出的内容",
+    exportSwitchToRich: "已切换到 MD 模式，请再次点击导出",
     menuCloseAction: "关闭动作(C)",
     menuLanguage: "语言(L)",
     languageChinese: "简体中文",
@@ -607,6 +672,10 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     createdDocument: (title) => `已创建 ${title}，保存时再选择文件名和位置。`,
     editModeLabel: "编辑模式",
     viewLabel: "视图",
+    zoomLabel: "缩放",
+    zoomIn: "放大 (Ctrl/Cmd +)",
+    zoomOut: "缩小 (Ctrl/Cmd -)",
+    zoomReset: "重置缩放 (Ctrl/Cmd 0)",
     modeSource: "原文",
     outlineLabel: "目录",
     working: "处理中…",
@@ -622,6 +691,12 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     outlineHeader: "目录",
     outlineEmpty: "当前文档没有可展示的标题。",
     outlinePrompt: "打开文档后显示目录。",
+    searchPlaceholder: "搜索当前文档",
+    searchPrevious: "上一个",
+    searchNext: "下一个",
+    searchClose: "关闭搜索",
+    searchEmpty: "无结果",
+    searchResultCount: (current, total) => `${current} / ${total}`,
     dropToOpen: "松开以打开 Markdown 文档",
     dropToInsertAssets: "松开以插入图片或附件",
     dropMoveToEditorOverlay: "将图片或附件拖到编辑器中插入",
@@ -717,6 +792,17 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     menuNew: "New(N)",
     menuSave: "Save(S)",
     menuImages: "Attachments(I)",
+    menuExport: "Export",
+    exportPdf: "Export as PDF",
+    exportPng: "Export as Image (PNG)",
+    exportPdfDialogTitle: "Export as PDF",
+    exportPngDialogTitle: "Export as Image",
+    exportPdfSaved: (fileName: string) => `PDF exported: ${fileName}`,
+    exportPngSaved: (fileName: string) => `Image exported: ${fileName}`,
+    exportCanceled: "Export canceled",
+    exportFailed: "Export failed",
+    exportNoContent: "No content to export",
+    exportSwitchToRich: "Switched to MD mode — click export again",
     menuCloseAction: "Close Action(C)",
     menuLanguage: "Language(L)",
     languageChinese: "简体中文",
@@ -738,6 +824,10 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     createdDocument: (title) => `Created ${title}. Choose a file name and location when saving.`,
     editModeLabel: "Edit Mode",
     viewLabel: "View",
+    zoomLabel: "Zoom",
+    zoomIn: "Zoom in (Ctrl/Cmd +)",
+    zoomOut: "Zoom out (Ctrl/Cmd -)",
+    zoomReset: "Reset zoom (Ctrl/Cmd 0)",
     modeSource: "Source",
     outlineLabel: "Outline",
     working: "Working…",
@@ -753,6 +843,12 @@ const UI_TEXT: Record<UiLanguage, UiText> = {
     outlineHeader: "Outline",
     outlineEmpty: "No headings are available in the current document.",
     outlinePrompt: "Open a document to show its outline.",
+    searchPlaceholder: "Search this document",
+    searchPrevious: "Previous",
+    searchNext: "Next",
+    searchClose: "Close search",
+    searchEmpty: "No matches",
+    searchResultCount: (current, total) => `${current} / ${total}`,
     dropToOpen: "Drop to open the Markdown document",
     dropToInsertAssets: "Drop to insert images or attachments",
     dropMoveToEditorOverlay: "Drop images or attachments into the editor to insert",
@@ -890,6 +986,20 @@ const getInitialLanguage = (): UiLanguage => {
     : "en-US";
 };
 
+const getInitialContentZoom = (): number => {
+  if (typeof window === "undefined") {
+    return CONTENT_ZOOM_DEFAULT;
+  }
+
+  const stored = window.localStorage.getItem(CONTENT_ZOOM_STORAGE_KEY);
+  if (stored === null) {
+    return CONTENT_ZOOM_DEFAULT;
+  }
+
+  const parsed = Number.parseFloat(stored);
+  return Number.isNaN(parsed) ? CONTENT_ZOOM_DEFAULT : clampContentZoom(parsed);
+};
+
 const sanitizeImageFolderInput = (value: string) => {
   const normalized = value
     .trim()
@@ -989,13 +1099,13 @@ const formatAssetSize = (sizeBytes: number) => {
 const isImagePath = (path: string) => {
   const normalized = normalizeDroppedPath(path);
   return normalized
-    ? /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(normalized)
+    ? /\.(png|jpe?g|gif|webp|bmp|svg|avif|tiff?)$/i.test(normalized)
     : false;
 };
 
 const isImageFile = (file: File) =>
   file.type.startsWith("image/") ||
-  /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(file.name);
+  /\.(png|jpe?g|gif|webp|bmp|svg|avif|tiff?)$/i.test(file.name);
 
 const getClipboardAssetFileName = (file: File) => {
   if (file.name.trim()) {
@@ -1213,6 +1323,89 @@ const getRichHeadingElements = (root: HTMLDivElement | null) =>
       )
     : [];
 
+const getTextMatches = (text: string, query: string): TextMatch[] => {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const haystack = text.toLocaleLowerCase();
+  const matches: TextMatch[] = [];
+  let searchFrom = 0;
+
+  while (searchFrom <= haystack.length) {
+    const index = haystack.indexOf(normalizedQuery, searchFrom);
+    if (index < 0) {
+      break;
+    }
+
+    matches.push({
+      start: index,
+      end: index + normalizedQuery.length,
+    });
+    searchFrom = index + Math.max(normalizedQuery.length, 1);
+  }
+
+  return matches;
+};
+
+const getRichTextMatches = (root: HTMLDivElement, query: string): RichTextMatch[] => {
+  const editorSurface =
+    root.querySelector<HTMLElement>(".ProseMirror") ??
+    root.querySelector<HTMLElement>(".milkdown") ??
+    root;
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const walker = document.createTreeWalker(editorSurface, NodeFilter.SHOW_TEXT);
+  const textNodes: Array<{ node: Text; start: number; end: number }> = [];
+  let fullText = "";
+  let currentNode = walker.nextNode();
+
+  while (currentNode) {
+    if (currentNode instanceof Text && currentNode.data.length > 0) {
+      const start = fullText.length;
+      fullText += currentNode.data;
+      textNodes.push({
+        node: currentNode,
+        start,
+        end: fullText.length,
+      });
+    }
+    currentNode = walker.nextNode();
+  }
+
+  const matches = getTextMatches(fullText, normalizedQuery);
+  if (matches.length === 0) {
+    return [];
+  }
+
+  return matches
+    .map((match) => {
+      const startEntry = textNodes.find(
+        (entry) => match.start >= entry.start && match.start < entry.end,
+      );
+      const endIndex = Math.max(match.end - 1, match.start);
+      const endEntry = textNodes.find(
+        (entry) => endIndex >= entry.start && endIndex < entry.end,
+      );
+
+      if (!startEntry || !endEntry) {
+        return null;
+      }
+
+      return {
+        startNode: startEntry.node,
+        startOffset: match.start - startEntry.start,
+        endNode: endEntry.node,
+        endOffset: match.end - endEntry.start,
+      };
+    })
+    .filter((value): value is RichTextMatch => Boolean(value));
+};
+
 export default function App() {
   const initialLanguageRef = useRef<UiLanguage>(getInitialLanguage());
   const initialImageFolderRef = useRef(getInitialImageFolder());
@@ -1240,8 +1433,11 @@ export default function App() {
   const appDialogSettingCheckedRef = useRef(false);
   const confirmDialogPrimaryButtonRef = useRef<HTMLButtonElement | null>(null);
   const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const closeActionMenuRef = useRef<HTMLDivElement | null>(null);
   const languageMenuRef = useRef<HTMLDivElement | null>(null);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+  const editorPaneRef = useRef<HTMLElement | null>(null);
   const reloadingExternalTabIdsRef = useRef(new Set<string>());
   const watchedFileStateRef = useRef(new Map<string, WatchedDocumentStatePayload>());
   const pendingLocalWriteRef = useRef(
@@ -1260,12 +1456,21 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [dragState, setDragState] = useState<ExternalDragState>("idle");
   const [editorMode, setEditorMode] = useState<EditorMode>("rich");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchActiveIndex, setSearchActiveIndex] = useState(0);
+  const [searchResultCount, setSearchResultCount] = useState(0);
+  const [searchRevealNonce, setSearchRevealNonce] = useState(0);
   const [showOutline, setShowOutline] = useState(true);
+  const [contentZoom, setContentZoom] = useState<number>(getInitialContentZoom);
+  // 切换目录时临时锁死正文宽度，避免 DOM 重排与窗口 resize 之间的一两帧闪烁。
+  const [lockedEditorWidth, setLockedEditorWidth] = useState<number | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<string | null>(null);
   const [richEditorRoot, setRichEditorRoot] = useState<HTMLDivElement | null>(null);
   const [tabContextMenu, setTabContextMenu] = useState<TabContextMenuState | null>(null);
   const [closeActionMenuOpen, setCloseActionMenuOpen] = useState(false);
   const [languageMenuOpen, setLanguageMenuOpen] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [appDialog, setAppDialog] = useState<AppDialogState | null>(null);
   const [message, setMessage] = useState(
     UI_TEXT[initialLanguageRef.current].readyMessage,
@@ -1297,6 +1502,41 @@ export default function App() {
     () => (activeTab?.loaded ? extractOutlineItems(activeTab.content) : []),
     [activeTab?.loaded, activeTab?.content],
   );
+
+  const openSearch = useEffectEvent(() => {
+    setSearchOpen(true);
+    setSearchActiveIndex(0);
+    window.requestAnimationFrame(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    });
+  });
+
+  const closeSearch = useEffectEvent(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearchActiveIndex(0);
+    setSearchResultCount(0);
+  });
+
+  const moveSearchSelection = useEffectEvent((direction: 1 | -1) => {
+    setSearchActiveIndex((current) => {
+      if (searchResultCount <= 0) {
+        return 0;
+      }
+
+      return (current + direction + searchResultCount) % searchResultCount;
+    });
+    setSearchRevealNonce((current) => current + 1);
+  });
+
+  const isSearchInputFocused = useEffectEvent(() => {
+    if (typeof document === "undefined") {
+      return false;
+    }
+
+    return document.activeElement === searchInputRef.current;
+  });
 
   const closeAppDialog = useEffectEvent((result: string | null) => {
     const resolver = appDialogResolverRef.current;
@@ -1646,6 +1886,146 @@ export default function App() {
   }, [tabs]);
 
   useEffect(() => {
+    if (!searchOpen) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [searchOpen]);
+
+  useEffect(() => {
+    if (!searchOpen || !activeTab?.loaded) {
+      setSearchResultCount(0);
+      return;
+    }
+
+    const query = searchQuery.trim();
+    if (!query) {
+      setSearchResultCount(0);
+      return;
+    }
+
+    if (editorMode === "source") {
+      const textarea = sourceEditorRef.current;
+      const matches = getTextMatches(activeTab.content, query);
+      const count = matches.length;
+      setSearchResultCount((current) => (current === count ? current : count));
+      if (!textarea || count === 0) {
+        return;
+      }
+
+      const normalizedIndex = ((searchActiveIndex % count) + count) % count;
+      if (normalizedIndex !== searchActiveIndex) {
+        setSearchActiveIndex(normalizedIndex);
+        return;
+      }
+      return;
+    }
+
+    if (!richEditorRoot) {
+      setSearchResultCount(0);
+      return;
+    }
+
+    const matches = getRichTextMatches(richEditorRoot, query);
+    const count = matches.length;
+    setSearchResultCount((current) => (current === count ? current : count));
+    if (count === 0) {
+      return;
+    }
+
+    const normalizedIndex = ((searchActiveIndex % count) + count) % count;
+    if (normalizedIndex !== searchActiveIndex) {
+      setSearchActiveIndex(normalizedIndex);
+      return;
+    }
+  }, [
+    activeTab?.content,
+    activeTab?.id,
+    activeTab?.loaded,
+    editorMode,
+    richEditorRoot,
+    searchActiveIndex,
+    searchOpen,
+    searchQuery,
+  ]);
+
+  useEffect(() => {
+    if (!searchOpen || !activeTab?.loaded) {
+      return;
+    }
+
+    const query = searchQuery.trim();
+    if (!query || searchResultCount <= 0) {
+      return;
+    }
+
+    if (editorMode === "source") {
+      const textarea = sourceEditorRef.current;
+      if (!textarea) {
+        return;
+      }
+
+      const matches = getTextMatches(activeTab.content, query);
+      if (matches.length === 0) {
+        return;
+      }
+
+      const index = ((searchActiveIndex % matches.length) + matches.length) % matches.length;
+      const match = matches[index];
+      textarea.setSelectionRange(match.start, match.end);
+
+      const lineHeight = Number.parseFloat(window.getComputedStyle(textarea).lineHeight) || 22;
+      const line = textarea.value.slice(0, match.start).split("\n").length - 1;
+      textarea.scrollTop = Math.max(line - 2, 0) * lineHeight;
+      return;
+    }
+
+    if (!richEditorRoot) {
+      return;
+    }
+
+    const matches = getRichTextMatches(richEditorRoot, query);
+    if (matches.length === 0) {
+      return;
+    }
+
+    const index = ((searchActiveIndex % matches.length) + matches.length) % matches.length;
+    const match = matches[index];
+    const range = document.createRange();
+    range.setStart(match.startNode, match.startOffset);
+    range.setEnd(match.endNode, match.endOffset);
+
+    if (!isSearchInputFocused()) {
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }
+
+    range.startContainer.parentElement?.scrollIntoView({
+      block: "center",
+      behavior: "smooth",
+    });
+  }, [
+    activeTab?.content,
+    activeTab?.id,
+    activeTab?.loaded,
+    editorMode,
+    isSearchInputFocused,
+    richEditorRoot,
+    searchActiveIndex,
+    searchOpen,
+    searchQuery,
+    searchResultCount,
+    searchRevealNonce,
+  ]);
+
+  useEffect(() => {
     recentlyClosedTabsRef.current = recentlyClosedTabs;
 
     try {
@@ -1783,13 +2163,18 @@ export default function App() {
       const loadedTabs = await Promise.all(
         pendingPaths.map(async (path) => {
           const content = await invoke<string>("read_markdown_file", { path });
+          const normalizedContent = normalizeTaskListMarkdown(content);
+          logTaskListDebug("app:load", content, normalizedContent, {
+            sourcePath: path,
+            reason: "open-paths",
+          });
           const nextTab: EditorTab = {
             id: path,
             path,
             sourcePath: path,
             title: getFileName(path),
-            content,
-            savedContent: content,
+            content: normalizedContent,
+            savedContent: normalizedContent,
             dirty: false,
             storageKind: "saved",
             loaded: true,
@@ -1828,6 +2213,27 @@ export default function App() {
   const handleOpenRequestedPaths = useEffectEvent((paths: string[]) => {
     void openPaths(paths);
   });
+
+  const drainPendingMarkdownOpenRequests = useEffectEvent(
+    async (fallbackPaths: string[] = []) => {
+      try {
+        const pendingPaths = await invoke<string[]>("take_pending_markdown_files");
+        const nextPaths = pendingPaths.length > 0 ? pendingPaths : fallbackPaths;
+        if (nextPaths.length === 0) {
+          return;
+        }
+
+        await openPaths(nextPaths);
+      } catch (error) {
+        if (fallbackPaths.length > 0) {
+          await openPaths(fallbackPaths);
+          return;
+        }
+
+        console.warn("[TinyMD] failed to drain pending markdown open requests", error);
+      }
+    },
+  );
 
   const handleOpenFiles = async () => {
     const result = await open({
@@ -2126,19 +2532,63 @@ export default function App() {
   const handleRichEditorChange = (tabId: string, content: string) => {
     const normalizedContent = normalizeTaskListMarkdown(content);
     logTaskListDebug("app:rich-change", content, normalizedContent, { tabId });
-    startTransition(() => {
-      setTabs((current) =>
-        current.map((tab) =>
-          tab.id === tabId
-            ? {
-                ...tab,
-                content: normalizedContent,
-                dirty: normalizedContent !== tab.savedContent,
-              }
-            : tab,
-        ),
-      );
-    });
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === tabId
+          ? {
+              ...tab,
+              content: normalizedContent,
+              dirty: normalizedContent !== tab.savedContent,
+            }
+          : tab,
+      ),
+    );
+  };
+
+  const handleRichEditorCanonicalize = (tabId: string, content: string) => {
+    const normalizedContent = normalizeTaskListMarkdown(content);
+    logTaskListDebug("app:rich-canonicalize", content, normalizedContent, { tabId });
+    setTabs((current) =>
+      current.map((tab) => {
+        if (tab.id !== tabId) {
+          return tab;
+        }
+
+        const normalizedSavedContent = normalizeTaskListMarkdown(tab.savedContent);
+
+        if (normalizedContent === normalizedSavedContent) {
+          if (
+            normalizedContent === tab.content &&
+            normalizedSavedContent === tab.savedContent &&
+            !tab.dirty
+          ) {
+            return tab;
+          }
+
+          return {
+            ...tab,
+            content: normalizedContent,
+            savedContent: normalizedSavedContent,
+            dirty: false,
+          };
+        }
+
+        if (tab.dirty || tab.content !== tab.savedContent) {
+          return tab;
+        }
+
+        if (normalizedContent === tab.content && normalizedContent === tab.savedContent) {
+          return tab;
+        }
+
+        return {
+          ...tab,
+          content: normalizedContent,
+          savedContent: normalizedContent,
+          dirty: false,
+        };
+      }),
+    );
   };
 
   const handleSourceEditorChange = (tabId: string, content: string) => {
@@ -2285,7 +2735,7 @@ export default function App() {
         return;
       }
 
-      handleOpenRequestedPaths(paths);
+      void drainPendingMarkdownOpenRequests(paths);
     }).then((dispose) => {
       unlisten = dispose;
     });
@@ -2293,7 +2743,11 @@ export default function App() {
     return () => {
       unlisten?.();
     };
-  }, []);
+  }, [drainPendingMarkdownOpenRequests]);
+
+  useEffect(() => {
+    void drainPendingMarkdownOpenRequests();
+  }, [drainPendingMarkdownOpenRequests]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -2759,6 +3213,36 @@ export default function App() {
       window.removeEventListener("blur", closeMenu);
     };
   }, [closeActionMenuOpen]);
+
+  useEffect(() => {
+    if (!exportMenuOpen) {
+      return;
+    }
+
+    const closeMenu = () => setExportMenuOpen(false);
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && exportMenuRef.current?.contains(target)) {
+        return;
+      }
+      closeMenu();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeMenu();
+      }
+    };
+
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("blur", closeMenu);
+
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("blur", closeMenu);
+    };
+  }, [exportMenuOpen]);
 
   useEffect(() => {
     if (!tabContextMenu) {
@@ -3814,12 +4298,199 @@ export default function App() {
   }, [getRecentNativeDropPaths, t.dropMoveToEditorMessage]);
 
   useEffect(() => {
+    window.localStorage.setItem(CONTENT_ZOOM_STORAGE_KEY, String(contentZoom));
+    // 使用 webview 原生缩放（等同浏览器 Ctrl+±）。相比 CSS zoom，原生缩放不会
+    // 破坏 contenteditable 的光标定位（WebKit 已知问题）。
+    void getCurrentWebview()
+      .setZoom(contentZoom)
+      .catch((error) => {
+        console.error("[tinymd] set webview zoom failed", error);
+      });
+  }, [contentZoom]);
+
+  const adjustContentZoom = useCallback((delta: number) => {
+    setContentZoom((current) => clampContentZoom(current + delta));
+  }, []);
+
+  const resetContentZoom = useCallback(() => {
+    setContentZoom(CONTENT_ZOOM_DEFAULT);
+  }, []);
+
+  // 切换目录时同步增减窗口宽度，使正文宽度保持不变（而不是挤压正文）。
+  // 过渡期间锁死正文宽度并按方向排序「改 DOM / 改窗口」，避免闪烁：
+  // - 显示：先挂目录（此时溢出被窗口裁掉），再放大窗口让目录露出。
+  // - 隐藏：先缩小窗口（目录被裁到窗口外），再卸载目录。
+  const handleToggleOutline = useCallback(async () => {
+    const next = !showOutline;
+
+    let maximized = false;
+    try {
+      maximized = await getCurrentWindow().isMaximized();
+    } catch {
+      maximized = false;
+    }
+
+    // 最大化时无法加宽窗口，退回到默认的挤压行为。
+    if (maximized) {
+      setShowOutline(next);
+      return;
+    }
+
+    const paneWidth = editorPaneRef.current?.getBoundingClientRect().width ?? null;
+    if (paneWidth != null) {
+      setLockedEditorWidth(paneWidth);
+    }
+
+    const resizeWindow = async () => {
+      try {
+        const win = getCurrentWindow();
+        const factor = await win.scaleFactor();
+        const logical = (await win.innerSize()).toLogical(factor);
+        const delta = next ? OUTLINE_PANE_TOTAL_WIDTH : -OUTLINE_PANE_TOTAL_WIDTH;
+        await win.setSize(
+          new LogicalSize(
+            Math.max(MIN_APP_WIDTH, Math.round(logical.width + delta)),
+            Math.round(logical.height),
+          ),
+        );
+      } catch (error) {
+        console.error("[tinymd] resize on outline toggle failed", error);
+      }
+    };
+
+    if (next) {
+      setShowOutline(true);
+      await resizeWindow();
+    } else {
+      await resizeWindow();
+      setShowOutline(false);
+    }
+
+    // 等 DOM 与窗口都到位后再解锁正文宽度。
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => setLockedEditorWidth(null));
+    });
+  }, [showOutline]);
+
+  const getExportBaseName = useCallback((): string => {
+    const rawTitle = activeTab?.title?.trim() || "document";
+    return rawTitle.replace(/\.(md|markdown)$/i, "");
+  }, [activeTab]);
+
+  const ensureExportableEditor = useCallback((): HTMLElement | null => {
+    if (editorMode === "source") {
+      setMessage(t.exportSwitchToRich);
+      setEditorMode("rich");
+      return null;
+    }
+    if (!richEditorRoot) {
+      setMessage(t.exportNoContent);
+      return null;
+    }
+    return richEditorRoot;
+  }, [editorMode, richEditorRoot, t]);
+
+  const handleExportPdf = useCallback(async () => {
+    setExportMenuOpen(false);
+    const root = ensureExportableEditor();
+    if (!root) {
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const targetPath = await save({
+        title: t.exportPdfDialogTitle,
+        defaultPath: `${getExportBaseName()}.pdf`,
+        filters: [{ name: "PDF", extensions: ["pdf"] }],
+      });
+      if (!targetPath || Array.isArray(targetPath)) {
+        setMessage(t.exportCanceled);
+        return;
+      }
+
+      const bytes = await renderToPdfBytes(root);
+      if (!bytes) {
+        setMessage(t.exportNoContent);
+        return;
+      }
+
+      await invoke("export_write_bytes", {
+        path: String(targetPath),
+        bytes: Array.from(bytes),
+      });
+      setMessage(t.exportPdfSaved(getFileName(String(targetPath))));
+    } catch (error) {
+      console.error("[tinymd] export pdf failed", error);
+      setMessage(`${t.exportFailed}: ${String((error as Error)?.message ?? error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [ensureExportableEditor, getExportBaseName, t]);
+
+  const handleExportPng = useCallback(async () => {
+    setExportMenuOpen(false);
+    const root = ensureExportableEditor();
+    if (!root) {
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const targetPath = await save({
+        title: t.exportPngDialogTitle,
+        defaultPath: `${getExportBaseName()}.png`,
+        filters: [{ name: "PNG", extensions: ["png"] }],
+      });
+      if (!targetPath || Array.isArray(targetPath)) {
+        setMessage(t.exportCanceled);
+        return;
+      }
+
+      const bytes = await renderToPngBytes(root);
+      if (!bytes) {
+        setMessage(t.exportNoContent);
+        return;
+      }
+
+      await invoke("export_write_bytes", {
+        path: String(targetPath),
+        bytes: Array.from(bytes),
+      });
+      setMessage(t.exportPngSaved(getFileName(String(targetPath))));
+    } catch (error) {
+      console.error("[tinymd] export png failed", error);
+      setMessage(`${t.exportFailed}: ${String((error as Error)?.message ?? error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [ensureExportableEditor, getExportBaseName, t]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.altKey) {
         return;
       }
 
       const key = event.key.toLowerCase();
+      if (key === "=" || key === "+") {
+        event.preventDefault();
+        adjustContentZoom(CONTENT_ZOOM_STEP);
+        return;
+      }
+
+      if (key === "-" || key === "_") {
+        event.preventDefault();
+        adjustContentZoom(-CONTENT_ZOOM_STEP);
+        return;
+      }
+
+      if (key === "0") {
+        event.preventDefault();
+        resetContentZoom();
+        return;
+      }
+
       if (key === "t" && event.shiftKey) {
         event.preventDefault();
         void handleRestoreRecentlyClosedTab();
@@ -3838,6 +4509,12 @@ export default function App() {
         return;
       }
 
+      if (key === "f") {
+        event.preventDefault();
+        openSearch();
+        return;
+      }
+
       if (key === "n") {
         event.preventDefault();
         handleCreateDocument();
@@ -3849,8 +4526,16 @@ export default function App() {
   });
 
   return (
-    <div className="app-shell">
-      <main className="editor-pane pane">
+    <div className={`app-shell${searchOpen ? " is-search-open" : ""}`}>
+      <main
+        className="editor-pane pane"
+        ref={editorPaneRef}
+        style={
+          lockedEditorWidth != null
+            ? { flex: `0 0 ${lockedEditorWidth}px`, width: lockedEditorWidth }
+            : undefined
+        }
+      >
         <div className="pane-header">
           <div className="header-actions">
             <button
@@ -3882,6 +4567,40 @@ export default function App() {
             >
               {t.menuImages}
             </button>
+            <div className="header-menu" ref={exportMenuRef}>
+              <button
+                type="button"
+                className={`menu-button ${exportMenuOpen ? "is-active" : ""}`}
+                aria-haspopup="menu"
+                aria-expanded={exportMenuOpen}
+                disabled={!activeTab || !activeTab.loaded}
+                onClick={() => {
+                  setCloseActionMenuOpen(false);
+                  setLanguageMenuOpen(false);
+                  setExportMenuOpen((current) => !current);
+                }}
+              >
+                {t.menuExport}
+              </button>
+              {exportMenuOpen ? (
+                <div className="menu-popup" role="menu">
+                  <button
+                    type="button"
+                    className="menu-popup__item"
+                    onClick={() => void handleExportPdf()}
+                  >
+                    {t.exportPdf}
+                  </button>
+                  <button
+                    type="button"
+                    className="menu-popup__item"
+                    onClick={() => void handleExportPng()}
+                  >
+                    {t.exportPng}
+                  </button>
+                </div>
+              ) : null}
+            </div>
             <div className="header-menu" ref={closeActionMenuRef}>
               <button
                 type="button"
@@ -3979,6 +4698,64 @@ export default function App() {
           }
         />
 
+        {searchOpen ? (
+          <div className="find-bar" role="search">
+            <input
+              ref={searchInputRef}
+              type="text"
+              className="find-bar__input"
+              value={searchQuery}
+              placeholder={t.searchPlaceholder}
+              onChange={(event) => {
+                setSearchQuery(event.target.value);
+                setSearchActiveIndex(0);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  closeSearch();
+                  return;
+                }
+
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  moveSearchSelection(event.shiftKey ? -1 : 1);
+                }
+              }}
+            />
+            <span className="find-bar__count" aria-live="polite">
+              {searchQuery.trim()
+                ? searchResultCount > 0
+                  ? t.searchResultCount(searchActiveIndex + 1, searchResultCount)
+                  : t.searchEmpty
+                : ""}
+            </span>
+            <button
+              type="button"
+              className="find-bar__button"
+              onClick={() => moveSearchSelection(-1)}
+              disabled={searchResultCount === 0}
+            >
+              {t.searchPrevious}
+            </button>
+            <button
+              type="button"
+              className="find-bar__button"
+              onClick={() => moveSearchSelection(1)}
+              disabled={searchResultCount === 0}
+            >
+              {t.searchNext}
+            </button>
+            <button
+              type="button"
+              className="find-bar__button is-close"
+              onClick={() => closeSearch()}
+            >
+              {t.searchClose}
+            </button>
+          </div>
+        ) : null}
+
         <div className="editor-stage">
           {activeTab ? (
             activeTab.loaded ? (
@@ -4037,6 +4814,9 @@ export default function App() {
                           })
                         : null;
                     }}
+                    onCanonicalizeMarkdown={(content) => {
+                      handleRichEditorCanonicalize(activeTab.id, content);
+                    }}
                     onChange={(content) => {
                       handleRichEditorChange(activeTab.id, content);
                     }}
@@ -4059,6 +4839,36 @@ export default function App() {
         <div className="status-bar">
           <span className="status-bar__message">{message}</span>
           <div className="status-bar__right">
+            <div className="status-zoom" role="group" aria-label={t.zoomLabel}>
+              <button
+                type="button"
+                className="status-zoom__button"
+                aria-label={t.zoomOut}
+                title={t.zoomOut}
+                disabled={contentZoom <= CONTENT_ZOOM_MIN}
+                onClick={() => adjustContentZoom(-CONTENT_ZOOM_STEP)}
+              >
+                −
+              </button>
+              <button
+                type="button"
+                className="status-zoom__value"
+                title={t.zoomReset}
+                onClick={resetContentZoom}
+              >
+                {Math.round(contentZoom * 100)}%
+              </button>
+              <button
+                type="button"
+                className="status-zoom__button"
+                aria-label={t.zoomIn}
+                title={t.zoomIn}
+                disabled={contentZoom >= CONTENT_ZOOM_MAX}
+                onClick={() => adjustContentZoom(CONTENT_ZOOM_STEP)}
+              >
+                +
+              </button>
+            </div>
             <div className="status-toggle" role="group" aria-label={t.editModeLabel}>
               <button
                 type="button"
@@ -4082,7 +4892,7 @@ export default function App() {
                 type="button"
                 className={`status-toggle__button ${showOutline ? "is-active" : ""}`}
                 aria-pressed={showOutline}
-                onClick={() => setShowOutline((current) => !current)}
+                onClick={handleToggleOutline}
               >
                 {t.outlineLabel}
               </button>

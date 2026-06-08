@@ -63,7 +63,7 @@ export const attachmentBlockConfig = $ctx(
   "attachmentBlockConfigCtx",
 );
 
-const isImagePath = (value: string) => /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(value);
+const isImagePath = (value: string) => /\.(png|jpe?g|gif|webp|bmp|svg|avif|tiff?)$/i.test(value);
 
 const isMarkdownPath = (value: string) => /\.(md|markdown)$/i.test(value);
 

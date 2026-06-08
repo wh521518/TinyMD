@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.0-beat.11 - 2026-06-08
+
+- Added page zoom via the status-bar control and `Ctrl/Cmd +/-/0`, using native webview zoom (persisted across sessions) so the caret stays correctly aligned.
+- Added document export to PDF and PNG (html2canvas + jsPDF), rendered from a clean cloned view that preserves the macOS custom list markers and embeds images.
+- Added a custom tab hover tooltip showing the full file path with a shorter delay than the native title.
+- Reworked outline show/hide to resize the window width instead of squeezing the body, keeping the body width constant and avoiding content flicker.
+- Tightened editor padding for both MD and source modes and aligned source-mode scrolling/margins with the rendered view; reduced the tab bar height and width.
+
 ## 1.0.0-beat.10 - 2026-04-02
 
 - Collapsed table-internal block handling into a single table-level handler so one table now uses one shared handle anchored at the table's top-left corner.
